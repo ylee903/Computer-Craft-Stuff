@@ -2,3 +2,11 @@ lua
 bridge = peripheral.wrap("right")
 print(bridge.getEnergyCapacity())
 print(bridge.getStoredEnergy())
+
+
+
+bridge = peripheral.wrap("right"); 
+it = bridge.getItem({name="minecraft:stick"});
+print((it and it.count) or 0);
+it = bridge.getItem({name="minecraft:glowstone_dust"}); 
+print((it and it.count) or 0);
