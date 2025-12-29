@@ -1,0 +1,4 @@
+lua
+bridge = peripheral.wrap("right")
+print(bridge.getEnergyCapacity())
+print(bridge.getStoredEnergy())
