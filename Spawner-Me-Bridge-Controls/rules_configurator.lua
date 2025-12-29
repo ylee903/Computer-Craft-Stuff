@@ -21,9 +21,9 @@
 --   2) Run:  rules
 --      (or:  lua rules_configurator.lua)
 --
--- Optional setup:
---   If your ME bridge is on the RIGHT side: it will auto-wrap peripheral.wrap("right").
---   If not found, it will try peripheral.find("meBridge").
+-- ME BRIDGE:
+--   Your ME Bridge peripheral name is: "me_bridge"
+--   This script will ONLY attempt: peripheral.wrap("me_bridge")
 
 local CONFIG = "master.cfg"
 
@@ -76,6 +76,7 @@ local function ensureTables(cfg)
   end
 end
 
+-- Purpose: reusable "choose an option" helper for multiple menus
 local function pickFromList(title, items)
   print(title)
   for i, v in ipairs(items) do
@@ -99,17 +100,13 @@ local function indexByItem(list, item)
   return nil
 end
 
--- ====== ME Bridge optional ======
+-- ====== ME Bridge optional (explicit name) ======
 local bridge
-local function tryAttachBridge()
-  -- prefer right if the user tends to put it there
-  if peripheral.isPresent("right") then
-    local t = peripheral.getType("right")
-    if t == "meBridge" then
-      return peripheral.wrap("right")
-    end
+local function attachBridge()
+  if peripheral.isPresent("me_bridge") then
+    return peripheral.wrap("me_bridge")
   end
-  return peripheral.find("meBridge")
+  return nil
 end
 
 local function meCount(name)
@@ -129,8 +126,10 @@ end
 
 -- ====== rule operations ======
 local function printRulesForSlave(cfg, slave)
-  local sc = cfg.slave_cfg[slave] or { rules = { on_any = {}, off_all = {} } }
+  local sc = cfg.slave_cfg[slave] or { mode = "AUTO", rules = { on_any = {}, off_all = {} } }
   local rules = sc.rules or { on_any = {}, off_all = {} }
+
+  print("\nMode: " .. tostring(sc.mode or "AUTO"))
 
   print("\nON triggers (OR):")
   if #rules.on_any == 0 then
@@ -184,6 +183,7 @@ local function addOrEditOnRule(cfg, slave)
     table.insert(on_any, { item = item, low = low })
     print("Added new ON rule.")
   end
+
   saveCfg(cfg)
   pause("Saved. Press Enter")
 end
@@ -221,6 +221,7 @@ local function addOrEditOffRule(cfg, slave)
     table.insert(off_all, { item = item, high = high })
     print("Added new OFF rule.")
   end
+
   saveCfg(cfg)
   pause("Saved. Press Enter")
 end
@@ -271,7 +272,7 @@ end
 local function moveRulesToOtherSlave(cfg, fromSlave)
   cls()
   print("Move/Copy rules from: " .. fromSlave)
-  local idx, toSlave = pickFromList("Select destination slave:", cfg.slaves)
+  local _, toSlave = pickFromList("Select destination slave:", cfg.slaves)
   if not toSlave or toSlave == fromSlave then return end
 
   print("1) COPY rules  2) MOVE rules")
@@ -317,8 +318,8 @@ local function selectSlave(cfg)
   print("Known slaves:")
   for i, name in ipairs(cfg.slaves) do
     local sc = cfg.slave_cfg[name]
-    local onN = #(sc.rules.on_any or {})
-    local offN = #(sc.rules.off_all or {})
+    local onN = #((sc.rules and sc.rules.on_any) or {})
+    local offN = #((sc.rules and sc.rules.off_all) or {})
     print(string.format("  %2d) %s  (on_any=%d, off_all=%d, mode=%s)", i, name, onN, offN, tostring(sc.mode or "AUTO")))
   end
   print("  0) Cancel")
@@ -391,15 +392,15 @@ end
 
 ensureTables(cfg)
 
-bridge = tryAttachBridge()
+bridge = attachBridge()
 if bridge then
   cls()
-  print("ME Bridge detected.")
+  print("ME Bridge detected as 'me_bridge'.")
   print("Counts will be shown during rule entry to help confirm item names.")
   pause()
 else
   cls()
-  print("ME Bridge not detected (optional).")
+  print("ME Bridge 'me_bridge' not found (optional).")
   print("Rule entry will still work; you just won't see live counts.")
   pause()
 end
