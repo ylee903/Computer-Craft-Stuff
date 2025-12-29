@@ -6,7 +6,14 @@ print(bridge.getStoredEnergy())
 
 
 bridge = peripheral.wrap("right"); 
-it = bridge.getItem({name="minecraft:stick"});
-print((it and it.count) or 0);
-it = bridge.getItem({name="minecraft:glowstone_dust"}); 
-print((it and it.count) or 0);
+it = bridge.getItem({name="minecraft:stick"}); print((it and it.count) or 0);
+it = bridge.getItem({name="minecraft:glowstone_dust"}); print((it and it.count) or 0);
+glow = meCount("minecraft:glowstone_dust")
+sticks = meCount("minecraft:stick")
+
+
+
+print(peripheral.getType("right"))
+
+
+bridge = peripheral.wrap("right"); it = bridge.getItem({name="minecraft:stick"}); print((it and it.count) or 0);

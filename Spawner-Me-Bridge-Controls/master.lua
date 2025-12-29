@@ -1,36 +1,26 @@
 -- startup.lua (MASTER)
--- Dashboard + Slave Detail + Rules view + BASIC RULE ENGINE (AUTO)
--- Interlocks: ARM/DISARM + Screen STOP latch + ME power < 50% lockout
--- Comms: signed messages + STATUS requests + heartbeats to keep ON slaves alive
+-- Dashboard + Slave Detail + Rules (read-only) + Rule Engine (AUTO / FORCEON / FORCEOFF)
 --
--- RULE MODEL (per slave):
---   cfg.slave_cfg[name].rules.on_any  = { {item="minecraft:stick", low=2000}, ... }   -- OR
---   cfg.slave_cfg[name].rules.off_all = { {item="minecraft:stick", high=8000}, ... }  -- AND
---
--- AUTO behaviour:
---   - If currently OFF, any on_any trigger (count < low) => desired ON
---   - If currently ON, all off_all satisfied (count > high for every entry) => desired OFF
---   - If on_any empty: never turns on (AUTO defaults OFF)
---   - If off_all empty: once turned ON by low trigger, stays ON until operator changes mode
---
--- FORCEON behaviour:
---   - desired ON (subject to global interlocks)
--- FORCEOFF behaviour:
---   - desired OFF always
---
+-- Key features:
+--   * Reads master.cfg (created/edited by your editor programs)
+--   * Polls ME Bridge item counts on a configurable interval (RULE_TICK_SEC)
+--   * AUTO: hysteresis using ON (OR) and OFF (AND) rule lists
+--   * FORCEON / FORCEOFF: manual override (still subject to global interlocks)
+--   * Global interlocks:
+--       - ARM/DISARM (globalAllow)
+--       - Screen STOP latch
+--       - ME power low lockout (percent of capacity)
+--   * Shows live cached item counts next to rules on the slave detail page
+--   * Button to force an immediate rule scan (without changing RULE_TICK_SEC)
+
 local CONFIG   = "master.cfg"
 local PROTOCOL = "spawner_ctrl_v3"
 
--- ===== Tunables =====
-local UI_TEXT_SCALE = 0.5
-local RULE_TICK_SEC = 1.0        -- how often to re-evaluate rules (keeps ME polling reasonable)
-local HB_PERIOD_SEC = 4.8        -- send heartbeats slightly faster than slave timeout
-local ME_LOCKOUT_RATIO = 0.50    -- < 50% stored/capacity => LOCKOUT
+-- ====== TUNABLES ======
+local RULE_TICK_SEC = 1.0       -- set to 60 or 300 later; keep small while testing
+local ME_MIN_PCT    = 0.50      -- lockout if stored/capacity < 50%
 
--- Where your ME Bridge is:
-local ME_BRIDGE_SIDE = "right"   -- you said: peripheral.wrap("right")
-
--- ===== UTIL =====
+-- ====== UTIL ======
 local function openModem()
   for _, p in ipairs(peripheral.getNames()) do
     if peripheral.getType(p) == "modem" then
@@ -76,7 +66,13 @@ local function clamp(x,a,b)
   return x
 end
 
--- ===== CONFIG BOOTSTRAP =====
+local function safeCall(fn, ...)
+  local ok, a, b, c, d = pcall(fn, ...)
+  if not ok then return nil end
+  return a, b, c, d
+end
+
+-- ====== CONFIG BOOTSTRAP ======
 local cfg = load()
 if not cfg then
   term.clear(); term.setCursorPos(1,1)
@@ -88,9 +84,10 @@ end
 cfg.slaves = cfg.slaves or {}
 cfg.key = cfg.key or ""
 cfg.globalAllow = cfg.globalAllow ~= false
+cfg.me = cfg.me or {}
+cfg.me.minPct = cfg.me.minPct or ME_MIN_PCT
 cfg.interlocks = cfg.interlocks or { screenStop = false }
 
--- per-slave config (mode + rules). Backwards compatible.
 cfg.slave_cfg = cfg.slave_cfg or {}
 for _,name in ipairs(cfg.slaves) do
   cfg.slave_cfg[name] = cfg.slave_cfg[name] or { mode = "AUTO", rules = { on_any = {}, off_all = {} } }
@@ -114,81 +111,62 @@ if not openModem() then error("No modem found.") end
 
 local mon = peripheral.find("monitor")
 if not mon then error("No monitor found.") end
-mon.setTextScale(UI_TEXT_SCALE)
+mon.setTextScale(0.5)
 
--- ===== ME BRIDGE =====
-local bridge = peripheral.wrap(ME_BRIDGE_SIDE)
-if not bridge then
-  error("No ME Bridge found on side '"..ME_BRIDGE_SIDE.."'.")
+-- ====== ME BRIDGE ATTACH ======
+-- Your ME Bridge peripheral type is "me_bridge" (Advanced Peripherals). It may be on the right.
+local function tryAttachBridge()
+  if peripheral.isPresent("right") then
+    local t = peripheral.getType("right")
+    if t == "me_bridge" or t == "meBridge" then
+      return peripheral.wrap("right")
+    end
+  end
+  -- fallback: scan for a matching type
+  for _, p in ipairs(peripheral.getNames()) do
+    local t = peripheral.getType(p)
+    if t == "me_bridge" or t == "meBridge" then
+      return peripheral.wrap(p)
+    end
+  end
+  return nil
 end
 
--- robust count helper (handles count vs amount variations)
-local function meCount(name)
-  local it = bridge.getItem({ name = name })
-  if not it then return 0 end
-  return it.count or it.amount or 0
-end
+local bridge = tryAttachBridge()
 
-local function getStoredEnergy()
-  -- You noted both sets exist; prefer the names you tested.
-  local ok, v = pcall(function() return bridge.getStoredEnergy() end)
-  if ok and type(v) == "number" then return v end
-  -- fallback to documented name
-  ok, v = pcall(function() return bridge.getEnergyStorage() end)
-  if ok and type(v) == "number" then return v end
-  return 0
-end
-
-local function getEnergyCapacity()
-  local ok, v = pcall(function() return bridge.getEnergyCapacity() end)
-  if ok and type(v) == "number" then return v end
-  -- fallback to documented name
-  ok, v = pcall(function() return bridge.getMaxEnergyStorage() end)
-  if ok and type(v) == "number" then return v end
-  return 0
-end
-
--- ===== STATE =====
+-- ====== STATE ======
 local state = {
-  -- paging for dashboard slave table
   page = 1,
   perPage = 12,
 
-  -- selection
   selectedIndex = nil,
   selectedName = nil,
 
-  -- global controls
   armed = cfg.globalAllow,
   screenStop = cfg.interlocks.screenStop or false,
 
   lockoutReasons = {},
 
-  -- last known statuses (from STATUS_RSP)
-  status = {}, -- status[name] = { actual="ON/OFF", enabled=bool, side="back", reason="...", last=os.clock(), hbAge="0.4s" }
+  status = {},
 
-  -- rule engine memory
-  autoLatch = {},     -- autoLatch[name] = bool (what AUTO currently wants, with hysteresis)
-  desired = {},       -- desired[name] = bool (final desired before interlocks)
-  lastSent = {},      -- lastSent[name] = bool (avoid spamming commands)
-
-  -- page system
   pageName = "DASH", -- DASH | SLAVE | RULES
   rulesPage = 1,
 
-  -- last computed ME power
-  meStored = 0,
-  meCap = 0,
-  meRatio = 0,
+  -- rule engine
+  rule = {
+    nextScanAt = 0,
+    lastScanAt = nil,
+    scanNow = true,
+    counts = {},        -- counts[itemName] = number
+    lastDesired = {},   -- lastDesired[slave] = "ON"|"OFF"
+    lastSent = {},      -- lastSent[slave] = "ON"|"OFF" (to reduce spam)
+  },
 }
 
--- ===== REDNET SEND =====
-local function sendToSlave(slaveName, kind, value, valueStr)
-  -- IMPORTANT: for signing, we must build a deterministic string.
-  -- For table values, provide a stable valueStr as well.
-  local vpart = valueStr or tostring(value or "")
-  local payload = (kind or "").."|"..(slaveName or "").."|"..vpart
-  local msg = { kind = kind, slave = slaveName, value = value, valueStr = vpart, s = sig(cfg.key, payload) }
+-- ====== REDNET SEND ======
+local function sendToSlave(slaveName, kind, value)
+  local payload = (kind or "").."|"..(slaveName or "").."|"..(value or "")
+  local msg = { kind = kind, slave = slaveName, value = value, s = sig(cfg.key, payload) }
   rednet.broadcast(msg, PROTOCOL)
 end
 
@@ -203,47 +181,51 @@ local function requestStatusOne(name)
   sendToSlave(name, "STATUS_REQ", "1")
 end
 
-local function cmdOn(name)
-  sendToSlave(name, "CMD", "ON")
-end
+-- ====== INTERLOCKS (ME POWER) ======
+local function getMeStoredAndCapacity()
+  if not bridge then return nil end
 
-local function cmdOff(name)
-  sendToSlave(name, "CMD", "OFF")
-end
+  -- You demonstrated these exist:
+  --   bridge.getStoredEnergy()
+  --   bridge.getEnergyCapacity()
+  local stored = safeCall(bridge.getStoredEnergy)
+  local cap = safeCall(bridge.getEnergyCapacity)
 
-local function sendHeartbeatAll()
-  -- Heartbeat doesn’t need to include value; slaves ignore HB unless enabled.
-  for _, name in ipairs(cfg.slaves) do
-    sendToSlave(name, "HB", "1")
+  if type(stored) ~= "number" or type(cap) ~= "number" then
+    -- fallback to alt API names if present
+    stored = safeCall(bridge.getEnergyStorage)
+    cap = safeCall(bridge.getMaxEnergyStorage)
   end
+
+  if type(stored) ~= "number" or type(cap) ~= "number" then
+    return nil
+  end
+
+  return stored, cap
 end
 
--- ===== INTERLOCKS =====
-local function computeMe()
-  local cap = getEnergyCapacity()
-  local st  = getStoredEnergy()
-  state.meCap = cap
-  state.meStored = st
-  if cap > 0 then
-    state.meRatio = st / cap
-  else
-    state.meRatio = 0
-  end
+local function computeMePct()
+  local stored, cap = getMeStoredAndCapacity()
+  if not stored or not cap or cap <= 0 then return nil end
+  return stored / cap, stored, cap
 end
 
 local function computeLockoutReasons()
-  computeMe()
   local reasons = {}
 
-  if state.meCap <= 0 then
-    table.insert(reasons, "ME CAP?")
-  else
-    if state.meRatio < ME_LOCKOUT_RATIO then
-      table.insert(reasons, string.format("ME < %d%%", math.floor(ME_LOCKOUT_RATIO * 100 + 0.5)))
+  local pct, stored, cap = computeMePct()
+  if pct ~= nil then
+    local minPct = cfg.me.minPct or ME_MIN_PCT
+    if pct < minPct then
+      table.insert(reasons, ("ME LOW (%.0f%% < %.0f%%)"):format(pct*100, minPct*100))
     end
+  else
+    -- if we can't read ME power, do NOT lock out by default; just warn in UI
   end
 
   if state.screenStop then table.insert(reasons, "SCREEN STOP") end
+  if not state.armed then table.insert(reasons, "DISARMED") end
+
   state.lockoutReasons = reasons
 end
 
@@ -251,132 +233,139 @@ local function isLockedOut()
   return #state.lockoutReasons > 0
 end
 
--- ===== RULE ENGINE =====
-local function getSlaveMode(name)
-  local sc = cfg.slave_cfg[name]
-  return (sc and sc.mode) or "AUTO"
+-- ====== ME ITEM COUNT CACHE ======
+local function meCount(itemName)
+  if not bridge then return nil end
+  local it = safeCall(bridge.getItem, { name = itemName })
+  if not it then return 0 end
+  return it.count or it.amount or 0
 end
 
-local function getRules(name)
-  local sc = cfg.slave_cfg[name]
-  if not sc then return { on_any = {}, off_all = {} } end
-  local r = sc.rules or { on_any = {}, off_all = {} }
-  r.on_any = r.on_any or {}
-  r.off_all = r.off_all or {}
-  return r
-end
-
-local function buildWatchedItems()
-  -- Collect unique items used in any rule across all slaves
+local function buildTrackedItemSet()
   local set = {}
-  for _, name in ipairs(cfg.slaves) do
-    local rules = getRules(name)
-    for _, r in ipairs(rules.on_any or {}) do
-      if r and r.item then set[r.item] = true end
-    end
-    for _, r in ipairs(rules.off_all or {}) do
-      if r and r.item then set[r.item] = true end
+  for _, slave in ipairs(cfg.slaves) do
+    local sc = cfg.slave_cfg[slave]
+    if sc and sc.rules then
+      for _, r in ipairs(sc.rules.on_any or {}) do
+        if r.item then set[r.item] = true end
+      end
+      for _, r in ipairs(sc.rules.off_all or {}) do
+        if r.item then set[r.item] = true end
+      end
     end
   end
-
-  local list = {}
-  for k,_ in pairs(set) do table.insert(list, k) end
-  table.sort(list)
-  return list
+  return set
 end
 
-local function sampleItemCounts(items)
-  -- one getItem call per unique item; cached for this tick
+local function scanAllTrackedItems()
+  if not bridge then
+    state.rule.counts = {}
+    state.rule.lastScanAt = os.clock()
+    return
+  end
+
+  local set = buildTrackedItemSet()
   local counts = {}
-  for _, itemName in ipairs(items) do
-    counts[itemName] = meCount(itemName)
+  for itemName, _ in pairs(set) do
+    local cnt = meCount(itemName)
+    counts[itemName] = cnt or 0
   end
-  return counts
+
+  state.rule.counts = counts
+  state.rule.lastScanAt = os.clock()
 end
 
-local function evalAutoDesired(name, counts)
-  local rules = getRules(name)
+local function countOf(itemName)
+  return (state.rule.counts and state.rule.counts[itemName]) or 0
+end
 
-  -- current latched state
-  local cur = state.autoLatch[name] == true
-
-  -- If OFF: check OR low triggers
-  if not cur then
-    for _, r in ipairs(rules.on_any or {}) do
-      if r and r.item and r.low ~= nil then
-        local c = counts[r.item] or 0
-        if c < tonumber(r.low) then
-          return true
-        end
+-- ====== RULE EVALUATION ======
+local function anyBelow(on_any)
+  if not on_any or #on_any == 0 then return false end
+  for _, r in ipairs(on_any) do
+    local item = r.item
+    local low = tonumber(r.low)
+    if item and low then
+      if countOf(item) < low then
+        return true
       end
     end
-    return false
   end
-
-  -- If ON: check AND high triggers
-  local offList = rules.off_all or {}
-  if #offList == 0 then
-    -- no off conditions => stay ON once started
-    return true
-  end
-
-  for _, r in ipairs(offList) do
-    if r and r.item and r.high ~= nil then
-      local c = counts[r.item] or 0
-      if not (c > tonumber(r.high)) then
-        return true -- not ready to turn off yet
-      end
-    else
-      return true -- malformed rule => be conservative
-    end
-  end
-
   return false
 end
 
-local function computeDesiredAll(counts)
-  for _, name in ipairs(cfg.slaves) do
-    local mode = getSlaveMode(name)
-    local want = false
-
-    if mode == "FORCEOFF" then
-      want = false
-    elseif mode == "FORCEON" then
-      want = true
-    else
-      -- AUTO or unknown
-      want = evalAutoDesired(name, counts)
-      state.autoLatch[name] = want
-    end
-
-    state.desired[name] = want
-  end
-end
-
-local function applyInterlocksAndSend()
-  computeLockoutReasons()
-
-  for _, name in ipairs(cfg.slaves) do
-    local want = state.desired[name] == true
-
-    -- Apply global interlocks
-    if not state.armed then want = false end
-    if isLockedOut() then want = false end
-
-    -- send only on change
-    if state.lastSent[name] == nil then
-      state.lastSent[name] = want
-      if want then cmdOn(name) else cmdOff(name) end
-    else
-      if state.lastSent[name] ~= want then
-        state.lastSent[name] = want
-        if want then cmdOn(name) else cmdOff(name) end
+local function allAbove(off_all)
+  if not off_all or #off_all == 0 then return false end
+  for _, r in ipairs(off_all) do
+    local item = r.item
+    local high = tonumber(r.high)
+    if item and high then
+      if not (countOf(item) > high) then
+        return false
       end
     end
   end
+  return true
 end
 
--- ===== UI PRIMITIVES =====
+local function computeDesiredForSlave(slave)
+  local sc = cfg.slave_cfg[slave] or { mode = "AUTO", rules = { on_any = {}, off_all = {} } }
+  local mode = sc.mode or "AUTO"
+
+  if isLockedOut() then return "OFF", "LOCKOUT" end
+
+  if mode == "FORCEOFF" then
+    return "OFF", "FORCEOFF"
+  elseif mode == "FORCEON" then
+    return "ON", "FORCEON"
+  end
+
+  -- AUTO hysteresis:
+  local last = state.rule.lastDesired[slave] or "OFF"
+  local onCond = anyBelow(sc.rules.on_any)
+  local offCond = allAbove(sc.rules.off_all)
+
+  if last == "OFF" then
+    if onCond then
+      return "ON", "AUTO"
+    else
+      return "OFF", "AUTO"
+    end
+  else
+    -- last ON
+    if offCond then
+      return "OFF", "AUTO"
+    else
+      return "ON", "AUTO"
+    end
+  end
+end
+
+local function applyDesired(slave, desired, why)
+  state.rule.lastDesired[slave] = desired
+
+  state.status[slave] = state.status[slave] or {}
+  state.status[slave].desired = desired
+  state.status[slave].reason = why or state.status[slave].reason
+
+  -- Send only when it changes (reduce spam)
+  if state.rule.lastSent[slave] ~= desired then
+    sendToSlave(slave, "CMD", desired)
+    state.rule.lastSent[slave] = desired
+  end
+end
+
+local function forceAllOff()
+  for _,name in ipairs(cfg.slaves) do
+    sendToSlave(name, "CMD", "OFF")
+    state.rule.lastSent[name] = "OFF"
+    state.rule.lastDesired[name] = "OFF"
+    state.status[name] = state.status[name] or {}
+    state.status[name].desired = "OFF"
+  end
+end
+
+-- ====== UI PRIMITIVES ======
 local function writeAt(x,y,text,fg,bg)
   if bg then mon.setBackgroundColor(bg) end
   if fg then mon.setTextColor(fg) end
@@ -385,7 +374,6 @@ local function writeAt(x,y,text,fg,bg)
 end
 
 local function fillLine(y,bg)
-  local w,_ = mon.getSize()
   mon.setCursorPos(1,y)
   mon.setBackgroundColor(bg or colors.black)
   mon.clearLine()
@@ -396,7 +384,7 @@ local function inRect(x,y, rx,ry, rw,rh)
   return x>=rx and x<=rx+rw-1 and y>=ry and y<=ry+rh-1
 end
 
--- ===== LAYOUT =====
+-- ====== LAYOUTS ======
 local ui = { buttons = {}, cols = {}, w=0,h=0, tableTopY=5, footerY=0 }
 
 local function computeLayoutDashboard()
@@ -411,7 +399,7 @@ local function computeLayoutDashboard()
   local buttons = {
     {id="ARM",   label= state.armed and "DISARM" or "ARM"},
     {id="STOP",  label= state.screenStop and "CLEAR STOP" or "STOP"},
-    {id="RESET", label= "RESET/RESUME"},
+    {id="SCAN",  label= "RULE SCAN"},
     {id="QUERY", label= "QUERY STATUS"},
     {id="RULES", label= "RULES"},
     {id="PREV",  label= "<"},
@@ -449,15 +437,7 @@ local function computeLayoutDashboard()
   local extra = w - totalMin()
   if extra > 0 then
     for _,c in ipairs(cols) do
-      if c.key == "name" then
-        -- give name column some extra too
-        c.w = c.w + math.floor(extra * 0.35)
-      end
-    end
-    for _,c in ipairs(cols) do
-      if c.key == "reason" then
-        c.w = c.w + math.floor(extra * 0.65)
-      end
+      if c.key == "reason" then c.w = c.w + extra end
     end
   end
 
@@ -480,11 +460,10 @@ local function computeLayoutSlave()
   local buttons = {
     {id="BACK",  label="BACK"},
     {id="QUERY", label="QUERY"},
+    {id="SCAN",  label="RULE SCAN"},
     {id="AUTO",  label="AUTO"},
     {id="FON",   label="FORCE ON"},
     {id="FOFF",  label="FORCE OFF"},
-    {id="ONCEON",label="ONCE ON"},
-    {id="ONCEOFF",label="ONCE OFF"},
   }
 
   local bx = 2
@@ -517,7 +496,7 @@ local function computeLayoutRules()
   ui.buttons = buttons
 end
 
--- ===== RENDER COMMON =====
+-- ====== RENDER COMMON HEADER ======
 local function drawHeader()
   computeLockoutReasons()
 
@@ -531,9 +510,14 @@ local function drawHeader()
   fillLine(1, colors.gray)
   writeAt(2,1,"Spawner Master", colors.black, colors.gray)
 
-  local ratioPct = (state.meCap > 0) and (state.meRatio * 100) or 0
-  local headRight = string.format("ME: %d/%d (%.0f%%)", state.meStored, state.meCap, ratioPct)
-  writeAt(math.max(2, w-#headRight-1), 1, headRight, colors.black, colors.gray)
+  local rightText
+  local pct, stored, cap = computeMePct()
+  if pct ~= nil then
+    rightText = ("ME=%.0f%%  (%d/%d)"):format(pct*100, stored, cap)
+  else
+    rightText = "ME=?? (bridge?)"
+  end
+  writeAt(math.max(2, w-#rightText-1), 1, rightText, colors.black, colors.gray)
 
   if isLockedOut() then
     fillLine(2, colors.red)
@@ -549,7 +533,7 @@ local function drawButtons()
     local bg, fg = colors.lightGray, colors.black
     if b.id == "ARM" then bg = state.armed and colors.orange or colors.lime end
     if b.id == "STOP" then bg = colors.red; fg = colors.white end
-    if b.id == "RESET" then bg = colors.cyan; fg = colors.black end
+    if b.id == "SCAN" then bg = colors.cyan; fg = colors.black end
     if b.id == "QUERY" then bg = colors.yellow; fg = colors.black end
     if b.id == "RULES" then bg = colors.lightBlue; fg = colors.black end
     if b.id == "PREV" or b.id == "NEXT" then bg = colors.gray; fg = colors.white end
@@ -558,14 +542,12 @@ local function drawButtons()
     if b.id == "AUTO" then bg = colors.lime; fg = colors.black end
     if b.id == "FON" then bg = colors.orange; fg = colors.black end
     if b.id == "FOFF" then bg = colors.orange; fg = colors.black end
-    if b.id == "ONCEON" then bg = colors.cyan; fg = colors.black end
-    if b.id == "ONCEOFF" then bg = colors.cyan; fg = colors.black end
 
     writeAt(b.x,b.y, padRight(b.label, b.w), fg, bg)
   end
 end
 
--- ===== DASH PAGE =====
+-- ====== DASHBOARD PAGE ======
 local function drawDashboard()
   computeLayoutDashboard()
   drawHeader()
@@ -587,14 +569,13 @@ local function drawDashboard()
     local name = cfg.slaves[i]
     local st = state.status[name] or {}
 
-    local mode = getSlaveMode(name)
-    local want = (state.desired[name] == true) and "ON" or "OFF"
+    local mode = (cfg.slave_cfg[name] and cfg.slave_cfg[name].mode) or "AUTO"
 
     local row = {
       name = name,
       mode = mode,
       actual = st.actual or "--",
-      desired = want,
+      desired = st.desired or state.rule.lastDesired[name] or "--",
       reason = st.reason or (isLockedOut() and "LOCKOUT" or "--"),
       hb = st.hbAge or "--"
     }
@@ -613,7 +594,7 @@ local function drawDashboard()
   writeAt(2, ui.footerY, foot, colors.gray, colors.black)
 end
 
--- ===== SLAVE DETAIL =====
+-- ====== SLAVE DETAIL PAGE ======
 local function drawSlaveDetail()
   computeLayoutSlave()
   drawHeader()
@@ -629,39 +610,49 @@ local function drawSlaveDetail()
   local sc = cfg.slave_cfg[name] or { mode="AUTO", rules={on_any={}, off_all={}} }
   local st = state.status[name] or {}
 
+  local age = "--"
+  if state.rule.lastScanAt then
+    age = string.format("%.1fs", os.clock() - state.rule.lastScanAt)
+  end
+
   writeAt(2,5, ("Slave: %s"):format(name), colors.white)
   writeAt(2,6, ("Mode: %s"):format(sc.mode or "AUTO"), colors.white)
-  writeAt(2,7, ("State: %s   HB: %s"):format(st.actual or "--", st.hbAge or "--"), colors.white)
-  writeAt(2,8, ("Desired: %s"):format((state.desired[name] == true) and "ON" or "OFF"), colors.white)
-  writeAt(2,9, ("Reason: %s"):format(st.reason or "--"), colors.white)
+  writeAt(2,7, ("State: %s   Want: %s"):format(st.actual or "--", st.desired or state.rule.lastDesired[name] or "--"), colors.white)
+  writeAt(2,8, ("Reason: %s"):format(st.reason or "--"), colors.white)
+  writeAt(2,9, ("Rule scan age: %s"):format(age), colors.gray)
 
-  writeAt(2,11,"ON triggers (OR):", colors.cyan)
+  writeAt(2,11,"ON triggers (OR):  (ANY item < low)", colors.cyan)
   local y = 12
   local shown = 0
   for _,r in ipairs(sc.rules.on_any or {}) do
     if y >= h-1 then break end
-    writeAt(2,y, ("- %s < %s"):format(tostring(r.item), tostring(r.low)), colors.white); y=y+1; shown=shown+1
+    local cnt = countOf(r.item)
+    local line = string.format("- %s  cnt=%d  < %s", tostring(r.item), tonumber(cnt) or 0, tostring(r.low))
+    writeAt(2,y,line, colors.white); y=y+1; shown=shown+1
   end
   if shown == 0 then writeAt(2,y,"(none)", colors.gray); y=y+1 end
 
-  writeAt(2,y+1,"OFF triggers (AND):", colors.cyan); y=y+2
+  y = y + 1
+  writeAt(2,y,"OFF triggers (AND): (ALL items > high)", colors.cyan); y=y+1
   shown = 0
   for _,r in ipairs(sc.rules.off_all or {}) do
     if y >= h-1 then break end
-    writeAt(2,y, ("- %s > %s"):format(tostring(r.item), tostring(r.high)), colors.white); y=y+1; shown=shown+1
+    local cnt = countOf(r.item)
+    local line = string.format("- %s  cnt=%d  > %s", tostring(r.item), tonumber(cnt) or 0, tostring(r.high))
+    writeAt(2,y,line, colors.white); y=y+1; shown=shown+1
   end
   if shown == 0 then writeAt(2,y,"(none)", colors.gray) end
 end
 
--- ===== RULES VIEW =====
+-- ====== RULES PAGE (READ-ONLY VIEW) ======
 local function drawRules()
   computeLayoutRules()
   drawHeader()
   drawButtons()
 
   local w,h = mon.getSize()
-  writeAt(2,5,"RULES (view). Edit via terminal editor program.", colors.white)
-  writeAt(2,6,("AUTO uses OR-low to start, AND-high to stop."), colors.white)
+  writeAt(2,5,"RULES (read-only). Edit via terminal rule configurator.", colors.white)
+  writeAt(2,6,("ME min pct cutoff: %.0f%%"):format((cfg.me.minPct or ME_MIN_PCT)*100), colors.white)
 
   local rowsTop = 8
   local per = math.max(1, h - rowsTop - 2)
@@ -687,47 +678,24 @@ local function drawRules()
   writeAt(2, h, foot, colors.gray)
 end
 
--- ===== ACTIONS =====
-local function forceAllOff()
-  for _,name in ipairs(cfg.slaves) do
-    cmdOff(name)
-    state.lastSent[name] = false
-    state.desired[name] = false
-    state.autoLatch[name] = false
-  end
-end
-
+-- ====== ACTIONS ======
 local function doArmToggle()
   state.armed = not state.armed
   cfg.globalAllow = state.armed
   save(cfg)
-  if not state.armed then
-    forceAllOff()
-  end
+  if not state.armed then forceAllOff() end
 end
 
 local function doStopToggle()
   state.screenStop = not state.screenStop
   cfg.interlocks.screenStop = state.screenStop
   save(cfg)
-  if state.screenStop then
-    forceAllOff()
-  end
+  if state.screenStop then forceAllOff() end
 end
 
-local function doResetResume()
-  -- Intention: after power restored + you want system to re-apply desired states
-  -- Behaviour:
-  --   - clears AUTO latch (so rules can re-trigger cleanly)
-  --   - immediately runs one rule tick + applies
-  if isLockedOut() then return end
-  if not state.armed then return end
-
-  for _,name in ipairs(cfg.slaves) do
-    state.autoLatch[name] = false
-  end
-
-  requestStatusAll()
+local function doRuleScanNow()
+  state.rule.scanNow = true
+  state.rule.nextScanAt = 0
 end
 
 local function gotoPage(name)
@@ -736,35 +704,14 @@ end
 
 local function setSlaveMode(slaveName, mode)
   if not slaveName then return end
-  cfg.slave_cfg[slaveName] = cfg.slave_cfg[slaveName] or { mode="AUTO", rules={on_any={}, off_all={}} }
+  cfg.slave_cfg[slaveName] = cfg.slave_cfg[slaveName] or { mode = "AUTO", rules={on_any={}, off_all={}} }
   cfg.slave_cfg[slaveName].mode = mode
   save(cfg)
-
-  -- If leaving AUTO, don’t keep old latch
-  if mode ~= "AUTO" then
-    state.autoLatch[slaveName] = false
-  end
+  -- force re-eval soon
+  doRuleScanNow()
 end
 
-local function doOnce(slaveName, on)
-  if not slaveName then return end
-  if isLockedOut() then return end
-  if not state.armed then return end
-
-  -- ONCE sends an immediate command but does not change stored mode
-  if on then
-    cmdOn(slaveName)
-    state.lastSent[slaveName] = true
-  else
-    cmdOff(slaveName)
-    state.lastSent[slaveName] = false
-  end
-
-  -- refresh status soon
-  requestStatusOne(slaveName)
-end
-
--- ===== RECEIVER LOOP =====
+-- ====== RECEIVER LOOP ======
 local function receiverLoop()
   while true do
     local sender, msg = rednet.receive(PROTOCOL, 0.5)
@@ -798,33 +745,66 @@ local function receiverLoop()
   end
 end
 
--- ===== TOUCH HANDLERS =====
+-- ====== RULE ENGINE LOOP ======
+local function ruleLoop()
+  -- initial scan immediately
+  state.rule.scanNow = true
+  state.rule.nextScanAt = 0
+
+  while true do
+    computeLockoutReasons()
+
+    local now = os.clock()
+    if state.rule.scanNow or now >= (state.rule.nextScanAt or 0) then
+      state.rule.scanNow = false
+      state.rule.nextScanAt = now + RULE_TICK_SEC
+
+      -- 1) refresh ME item cache
+      scanAllTrackedItems()
+
+      -- 2) compute + apply desired for each slave
+      for _, slave in ipairs(cfg.slaves) do
+        local desired, why = computeDesiredForSlave(slave)
+        applyDesired(slave, desired, why)
+      end
+
+      -- optional: request status after commanding, to refresh actual quickly
+      requestStatusAll()
+    end
+
+    -- if lockout just became true, slam everything off
+    if isLockedOut() then
+      forceAllOff()
+    end
+
+    sleep(0.1)
+  end
+end
+
+-- ====== TOUCH HANDLERS ======
 local function handleButtons(x,y)
   for _,b in ipairs(ui.buttons) do
     if inRect(x,y, b.x,b.y,b.w,b.h) then
       if state.pageName == "DASH" then
         if b.id == "ARM" then doArmToggle()
         elseif b.id == "STOP" then doStopToggle()
-        elseif b.id == "RESET" then doResetResume()
+        elseif b.id == "SCAN" then doRuleScanNow()
         elseif b.id == "QUERY" then requestStatusAll()
         elseif b.id == "RULES" then gotoPage("RULES")
         elseif b.id == "PREV" then state.page = math.max(1, state.page - 1)
         elseif b.id == "NEXT" then state.page = state.page + 1
         end
         return true
-
       elseif state.pageName == "SLAVE" then
         local name = state.selectedName
         if b.id == "BACK" then gotoPage("DASH")
         elseif b.id == "QUERY" then requestStatusOne(name)
+        elseif b.id == "SCAN" then doRuleScanNow()
         elseif b.id == "AUTO" then setSlaveMode(name, "AUTO")
         elseif b.id == "FON" then setSlaveMode(name, "FORCEON")
         elseif b.id == "FOFF" then setSlaveMode(name, "FORCEOFF")
-        elseif b.id == "ONCEON" then doOnce(name, true)
-        elseif b.id == "ONCEOFF" then doOnce(name, false)
         end
         return true
-
       elseif state.pageName == "RULES" then
         if b.id == "BACK" then gotoPage("DASH")
         elseif b.id == "PREV" then state.rulesPage = math.max(1, state.rulesPage - 1)
@@ -856,7 +836,7 @@ local function handleRowTapDashboard(x,y)
   return true
 end
 
--- ===== UI LOOP =====
+-- ====== UI LOOP ======
 local function uiLoop()
   while true do
     if state.pageName == "DASH" then
@@ -878,38 +858,14 @@ local function uiLoop()
   end
 end
 
--- ===== CONTROL LOOP =====
-local function controlLoop()
-  -- initial status request
-  requestStatusAll()
-
-  local lastRule = 0
-  local lastHB = 0
-
-  while true do
-    local now = os.clock()
-
-    -- Rule tick
-    if (now - lastRule) >= RULE_TICK_SEC then
-      lastRule = now
-
-      -- 1) build item list from rules, 2) sample counts once, 3) compute desired, 4) apply interlocks & send
-      local watched = buildWatchedItems()
-      local counts = sampleItemCounts(watched)
-
-      computeDesiredAll(counts)
-      applyInterlocksAndSend()
-    end
-
-    -- Heartbeats
-    if (now - lastHB) >= HB_PERIOD_SEC then
-      lastHB = now
-      sendHeartbeatAll()
-    end
-
-    -- keep loop light
-    sleep(0.05)
-  end
+-- ====== STARTUP ======
+-- Prime desired states to OFF so AUTO doesn't start in a weird state
+for _, name in ipairs(cfg.slaves) do
+  state.rule.lastDesired[name] = "OFF"
+  state.rule.lastSent[name] = nil
 end
 
-parallel.waitForAny(uiLoop, receiverLoop, controlLoop)
+-- do one scan quickly
+state.rule.scanNow = true
+
+parallel.waitForAny(uiLoop, receiverLoop, ruleLoop)
