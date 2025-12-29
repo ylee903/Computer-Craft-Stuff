@@ -156,7 +156,7 @@ local function controlLoop()
             print("CMD OFF -> OFF")
           end
 
-        elseif msg.kind == "HB" then
+        elseif msg.kind == "HB" or msg.kind == "ACK" then
           if enabled then lastHB = os.clock() end
 
         elseif msg.kind == "STATUS_REQ" then

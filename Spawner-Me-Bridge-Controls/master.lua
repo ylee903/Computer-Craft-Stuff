@@ -1,17 +1,27 @@
--- startup.lua (MASTER) - Dashboard + Slave Detail + Rules (read-only)
--- Completed: ME % lockout (<50%), screen STOP latch, ARM/DISARM, FORCEON/FORCEOFF logic, master heartbeats (HB)
--- AUTO currently does nothing (defaults to OFF), but is the placeholder for future rule engine.
+-- startup.lua (MASTER)
+-- Spawner Master (smooth UI):
+--   * ZERO full-screen clears during normal operation (only on page change / manual redraw)
+--   * ME energy + lockout banner update smoothly (cached poller -> UI just paints cached strings)
+--   * Rule engine runs on RULE_TICK_SEC + on-demand scan button
+--   * Heartbeat ACK broadcast every HEARTBEAT_SEC
+--   * RESET/RESUME button broadcasts RESUME (requires slave support) and re-allows CMD resend
 --
--- PATCH NOTES (2025-12-30):
---   * Fixed ME Bridge detection for servers where peripheral type is "me_bridge" (snake_case)
---   * Detection is now capability-based (checks for getItem / energy funcs)
---   * Added a NEW dashboard button: "RESET RULE SCAN" (does NOT remove any existing buttons)
---     - Reloads master.cfg from disk
---     - Re-attaches bridge
---     - Forces a status query + desired re-apply
+-- Why this version feels like your old UI skeleton:
+--   - No blocking ME Bridge calls inside the UI event loop.
+--   - No clearLine() spam in the header.
+--   - Header is repainted only if the composed line actually changed.
+--   - Full page redraw only when something structural changes (page/nav/selection).
 
 local CONFIG   = "master.cfg"
 local PROTOCOL = "spawner_ctrl_v3"
+
+-- ====== TUNABLES ======
+local RULE_TICK_SEC   = 1.0     -- rule eval + item cache scan interval
+local ME_POLL_SEC     = 0.5     -- ME energy poll (cached). 0.5 = very responsive
+local UI_REFRESH_SEC  = 0.25    -- UI header refresh tick (paints cached strings)
+local ME_MIN_PCT      = 0.50    -- lockout if stored/capacity < 50%
+local HEARTBEAT_SEC   = 4.9     -- ACK broadcast
+local STATUS_POLL_SEC = 5.0     -- periodic status request (optional)
 
 -- ====== UTIL ======
 local function openModem()
@@ -24,7 +34,7 @@ local function openModem()
   return false
 end
 
-local function load()
+local function loadCfg()
   if not fs.exists(CONFIG) then return nil end
   local f = fs.open(CONFIG, "r")
   local t = textutils.unserialize(f.readAll())
@@ -32,14 +42,20 @@ local function load()
   return t
 end
 
-local function save(cfg)
+local function saveCfg(cfg)
   local f = fs.open(CONFIG, "w")
   f.write(textutils.serialize(cfg))
   f.close()
 end
 
+local function safeCall(fn, ...)
+  local ok, a, b, c, d = pcall(fn, ...)
+  if not ok then return nil end
+  return a, b, c, d
+end
+
 local function sig(key, payload)
-  local s = payload .. "|" .. key
+  local s = tostring(payload) .. "|" .. tostring(key)
   local h = 0
   for i = 1, #s do
     h = (h * 33 + string.byte(s, i)) % 2147483647
@@ -53,14 +69,18 @@ local function padRight(s, n)
   return s .. string.rep(" ", n - #s)
 end
 
-local function clamp(x,a,b)
+local function clamp(x, a, b)
   if x < a then return a end
   if x > b then return b end
   return x
 end
 
--- ====== CONFIG BOOTSTRAP ======
-local cfg = load()
+local function now()
+  return os.clock()
+end
+
+-- ====== BOOTSTRAP CFG ======
+local cfg = loadCfg()
 if not cfg then
   term.clear(); term.setCursorPos(1,1)
   print("No " .. CONFIG .. " found.")
@@ -68,21 +88,19 @@ if not cfg then
   return
 end
 
-cfg.slaves = cfg.slaves or {}        -- list of names
+cfg.slaves = cfg.slaves or {}
 cfg.key = cfg.key or ""
 cfg.globalAllow = cfg.globalAllow ~= false
-
--- ME policy:
--- - cutoffPct: lockout if stored/capacity < cutoffPct (default 0.50)
--- - cutoffAbs: optional extra lockout if stored < cutoffAbs (0 disables)
-cfg.me = cfg.me or { cutoffPct = 0.50, cutoffAbs = 0 }
-
+cfg.me = cfg.me or {}
+cfg.me.minPct = cfg.me.minPct or ME_MIN_PCT
 cfg.interlocks = cfg.interlocks or { screenStop = false }
 
--- per-slave config (mode + rules summary). Backwards compatible.
 cfg.slave_cfg = cfg.slave_cfg or {}
-for _,name in ipairs(cfg.slaves) do
+for _, name in ipairs(cfg.slaves) do
   cfg.slave_cfg[name] = cfg.slave_cfg[name] or { mode = "AUTO", rules = { on_any = {}, off_all = {} } }
+  cfg.slave_cfg[name].rules = cfg.slave_cfg[name].rules or { on_any = {}, off_all = {} }
+  cfg.slave_cfg[name].rules.on_any = cfg.slave_cfg[name].rules.on_any or {}
+  cfg.slave_cfg[name].rules.off_all = cfg.slave_cfg[name].rules.off_all or {}
 end
 
 if not cfg.key or cfg.key == "" then
@@ -91,7 +109,7 @@ if not cfg.key or cfg.key == "" then
   print("Shared key not set.")
   write("Enter shared key (must match slaves): ")
   cfg.key = read("*")
-  save(cfg)
+  saveCfg(cfg)
   print("Key saved to " .. CONFIG)
   sleep(0.8)
 end
@@ -102,80 +120,79 @@ local mon = peripheral.find("monitor")
 if not mon then error("No monitor found.") end
 mon.setTextScale(0.5)
 
--- ====== ME BRIDGE (robust attach) ======
-local bridge = nil
-
-local function looksLikeMeBridge(p)
-  if type(p) ~= "table" then return false end
-  -- capability-based: any of these being present is good enough
-  return (type(p.getItem) == "function")
-      or (type(p.getStoredEnergy) == "function")
-      or (type(p.getEnergyCapacity) == "function")
-      or (type(p.getEnergyStorage) == "function")
-      or (type(p.getMaxEnergyStorage) == "function")
-end
-
-local function initBridge()
-  bridge = nil
-
-  -- Fast path: you said it is on the RIGHT side.
-  if peripheral.isPresent("right") then
-    local ok, p = pcall(peripheral.wrap, "right")
-    if ok and looksLikeMeBridge(p) then
-      bridge = p
-      return
+-- ====== ME BRIDGE (Advanced Peripherals) ======
+local function tryAttachBridge()
+  if peripheral.isPresent("right") and peripheral.getType("right") == "me_bridge" then
+    return peripheral.wrap("right")
+  end
+  for _, p in ipairs(peripheral.getNames()) do
+    if peripheral.getType(p) == "me_bridge" then
+      return peripheral.wrap(p)
     end
   end
-
-  -- Fallback: search by known type names across versions.
-  local p = peripheral.find("me_bridge") or peripheral.find("meBridge")
-  if p and looksLikeMeBridge(p) then
-    bridge = p
-  end
+  return nil
 end
 
-initBridge()
+local bridge = tryAttachBridge()
 
 -- ====== STATE ======
 local state = {
-  -- paging for dashboard slave table
-  page = 1,
-  perPage = 12,
-
-  -- selection
-  selectedIndex = nil,  -- index in cfg.slaves
-  selectedName = nil,   -- name string
-
-  -- global controls
-  armed = cfg.globalAllow,
-  screenStop = cfg.interlocks.screenStop or false,
-
-  -- computed lockouts
-  lockoutReasons = {},
-  lockedOut = false,
-
-  -- last known statuses (from STATUS_RSP)
-  status = {}, -- status[name] = { actual="ON/OFF", enabled=bool, side="back", reason="...", last=os.clock(), hbAge="0.4s" }
-
-  -- desired control computed by master
-  desired = {}, -- desired[name] = "ON"|"OFF"
-  lastCmd = {}, -- lastCmd[name] = "ON"|"OFF" (what master last sent)
-
-  -- for edge-triggered forceAllOff on entering lockout
-  wasLockedOut = false,
-
-  -- simple page system
   pageName = "DASH", -- DASH | SLAVE | RULES
+  page = 1,
+  perPage = 8,
   rulesPage = 1,
 
-  -- ME telemetry
-  me = { ok=false, stored=0, cap=0, pct=0, err=nil },
+  selectedIndex = nil,
+  selectedName  = nil,
+
+  armed      = cfg.globalAllow,
+  screenStop = cfg.interlocks.screenStop or false,
+
+  -- from slaves
+  status = {},
+
+  -- rule engine
+  rule = {
+    nextScanAt   = 0,
+    lastScanAt   = nil,
+    scanNow      = true,
+    counts       = {},
+    lastDesired  = {},
+    lastSent     = {},
+  },
+
+  -- cached ME + lockout strings (UI reads these; UI never calls bridge)
+  me = {
+    pct = nil,
+    stored = nil,
+    cap = nil,
+    headerRight = "ME=?? (bridge?)",
+    lockout = false,
+    lockoutReasons = {},
+    lockoutLine = "LOCKOUT: NONE",
+    lockoutBg = colors.green,
+    lockoutFg = colors.black,
+  },
+
+  -- UI caching
+  ui = {
+    w = 0, h = 0,
+    buttons = {},
+    cols = {},
+    tableTopY = 5,
+    footerY = 0,
+  },
+
+  -- header draw cache
+  _lastHeaderLine1 = nil,
+  _lastHeaderLine2 = nil,
 }
 
 -- ====== REDNET SEND ======
 local function sendToSlave(slaveName, kind, value)
-  local payload = (kind or "").."|"..(slaveName or "").."|"..(value or "")
-  local msg = { kind = kind, slave = slaveName, value = value, s = sig(cfg.key, payload) }
+  local v = (type(value) == "string") and value or tostring(value or "")
+  local payload = (kind or "") .. "|" .. (slaveName or "") .. "|" .. v
+  local msg = { kind = kind, slave = slaveName, value = value, valueStr = v, s = sig(cfg.key, payload) }
   rednet.broadcast(msg, PROTOCOL)
 end
 
@@ -186,140 +203,237 @@ local function requestStatusAll()
 end
 
 local function requestStatusOne(name)
-  if not name or name == "" then return end
-  sendToSlave(name, "STATUS_REQ", "1")
+  if name and name ~= "" then
+    sendToSlave(name, "STATUS_REQ", "1")
+  end
 end
 
--- ====== ME POWER READ ======
-local function readMePower()
-  if not bridge then
-    initBridge()
-    if not bridge then
-      state.me = { ok=false, stored=0, cap=0, pct=0, err="No ME Bridge" }
-      return
-    end
+local function sendAckAll()
+  for _, name in ipairs(cfg.slaves) do
+    sendToSlave(name, "ACK", "1")
   end
-
-  -- Try user-confirmed methods first, then fall back to Advanced Peripherals documented names.
-  local stored, cap
-
-  local ok1, r1 = pcall(function() return bridge.getStoredEnergy and bridge.getStoredEnergy() or nil end)
-  local ok2, r2 = pcall(function() return bridge.getEnergyCapacity and bridge.getEnergyCapacity() or nil end)
-
-  if ok1 and type(r1) == "number" then stored = r1 end
-  if ok2 and type(r2) == "number" then cap = r2 end
-
-  if (not stored) or (not cap) then
-    local ok3, r3 = pcall(function() return bridge.getEnergyStorage and bridge.getEnergyStorage() or nil end)
-    local ok4, r4 = pcall(function() return bridge.getMaxEnergyStorage and bridge.getMaxEnergyStorage() or nil end)
-    if not stored and ok3 and type(r3) == "number" then stored = r3 end
-    if not cap and ok4 and type(r4) == "number" then cap = r4 end
-  end
-
-  if type(stored) ~= "number" or type(cap) ~= "number" or cap <= 0 then
-    state.me = { ok=false, stored=tonumber(stored) or 0, cap=tonumber(cap) or 0, pct=0, err="ME read failed" }
-    return
-  end
-
-  local pct = stored / cap
-  state.me = { ok=true, stored=stored, cap=cap, pct=pct, err=nil }
 end
 
--- ====== INTERLOCKS ======
-local function computeLockoutReasons()
+local function sendResumeAll()
+  for _, name in ipairs(cfg.slaves) do
+    sendToSlave(name, "RESUME", "1")
+    sendToSlave(name, "ACK", "1")
+  end
+end
+
+-- ====== LOCKOUT / ME CACHE ======
+local function computeLockoutStrings()
   local reasons = {}
 
-  -- Always update ME telemetry before evaluating lockout.
-  readMePower()
+  if state.me.pct ~= nil then
+    local minPct = cfg.me.minPct or ME_MIN_PCT
+    if state.me.pct < minPct then
+      table.insert(reasons, ("ME LOW (%.0f%% < %.0f%%)"):format(state.me.pct * 100, minPct * 100))
+    end
+  end
 
-  -- Treat ME read failure as lockout (safe default).
-  if not state.me.ok then
-    table.insert(reasons, "ME ERR")
+  if state.screenStop then table.insert(reasons, "SCREEN STOP") end
+  if not state.armed then table.insert(reasons, "DISARMED") end
+
+  state.me.lockoutReasons = reasons
+  state.me.lockout = (#reasons > 0)
+
+  if state.me.lockout then
+    state.me.lockoutLine = "LOCKOUT: " .. table.concat(reasons, " | ")
+    state.me.lockoutBg = colors.red
+    state.me.lockoutFg = colors.white
   else
-    if (cfg.me.cutoffPct or 0) > 0 and state.me.pct < (cfg.me.cutoffPct or 0) then
-      table.insert(reasons, ("ME < %d%%"):format(math.floor((cfg.me.cutoffPct or 0)*100 + 0.5)))
-    end
-    if (cfg.me.cutoffAbs or 0) > 0 and state.me.stored < (cfg.me.cutoffAbs or 0) then
-      table.insert(reasons, "ME LOW")
-    end
+    state.me.lockoutLine = "LOCKOUT: NONE"
+    state.me.lockoutBg = colors.green
+    state.me.lockoutFg = colors.black
   end
-
-  if state.screenStop then
-    table.insert(reasons, "SCREEN STOP")
-  end
-
-  state.lockoutReasons = reasons
-  state.lockedOut = (#reasons > 0)
 end
 
 local function isLockedOut()
-  return state.lockedOut
+  return state.me.lockout
+end
+
+-- ====== ME ITEM COUNT CACHE ======
+local function meCount(itemName)
+  if not bridge then return nil end
+  local it = safeCall(bridge.getItem, { name = itemName })
+  if not it then return 0 end
+  return it.count or it.amount or 0
+end
+
+local function buildTrackedItemSet()
+  local set = {}
+  for _, slave in ipairs(cfg.slaves) do
+    local sc = cfg.slave_cfg[slave]
+    if sc and sc.rules then
+      for _, r in ipairs(sc.rules.on_any or {}) do
+        if r.item then set[r.item] = true end
+      end
+      for _, r in ipairs(sc.rules.off_all or {}) do
+        if r.item then set[r.item] = true end
+      end
+    end
+  end
+  return set
+end
+
+local function scanAllTrackedItems()
+  if not bridge then
+    state.rule.counts = {}
+    state.rule.lastScanAt = now()
+    return
+  end
+
+  local set = buildTrackedItemSet()
+  local counts = {}
+  for itemName, _ in pairs(set) do
+    local cnt = meCount(itemName)
+    counts[itemName] = cnt or 0
+  end
+
+  state.rule.counts = counts
+  state.rule.lastScanAt = now()
+end
+
+local function countOf(itemName)
+  return (state.rule.counts and state.rule.counts[itemName]) or 0
+end
+
+-- ====== RULE EVALUATION ======
+local function anyBelow(on_any)
+  if not on_any or #on_any == 0 then return false end
+  for _, r in ipairs(on_any) do
+    local item = r.item
+    local low  = tonumber(r.low)
+    if item and low then
+      if countOf(item) < low then return true end
+    end
+  end
+  return false
+end
+
+local function allAbove(off_all)
+  if not off_all or #off_all == 0 then return false end
+  for _, r in ipairs(off_all) do
+    local item = r.item
+    local high = tonumber(r.high)
+    if item and high then
+      if not (countOf(item) > high) then return false end
+    end
+  end
+  return true
+end
+
+local function computeDesiredForSlave(slave)
+  local sc = cfg.slave_cfg[slave] or { mode = "AUTO", rules = { on_any = {}, off_all = {} } }
+  local mode = sc.mode or "AUTO"
+
+  if isLockedOut() then return "OFF", "LOCKOUT" end
+
+  if mode == "FORCEOFF" then return "OFF", "FORCEOFF" end
+  if mode == "FORCEON"  then return "ON",  "FORCEON"  end
+
+  -- AUTO hysteresis
+  local last = state.rule.lastDesired[slave] or "OFF"
+  local onCond  = anyBelow(sc.rules.on_any)
+  local offCond = allAbove(sc.rules.off_all)
+
+  if last == "OFF" then
+    if onCond then return "ON", "AUTO" end
+    return "OFF", "AUTO"
+  else
+    if offCond then return "OFF", "AUTO" end
+    return "ON", "AUTO"
+  end
+end
+
+local function applyDesired(slave, desired, why)
+  state.rule.lastDesired[slave] = desired
+  state.status[slave] = state.status[slave] or {}
+  state.status[slave].desired = desired
+  state.status[slave].reason  = why or state.status[slave].reason
+
+  -- IMPORTANT: when you press RESUME we clear lastSent so commands resend.
+  if state.rule.lastSent[slave] ~= desired then
+    sendToSlave(slave, "CMD", desired)
+    state.rule.lastSent[slave] = desired
+  end
+end
+
+local function forceAllOff()
+  for _, name in ipairs(cfg.slaves) do
+    sendToSlave(name, "CMD", "OFF")
+    state.rule.lastSent[name] = "OFF"
+    state.rule.lastDesired[name] = "OFF"
+    state.status[name] = state.status[name] or {}
+    state.status[name].desired = "OFF"
+  end
 end
 
 -- ====== UI PRIMITIVES ======
-local function writeAt(x,y,text,fg,bg)
+local function writeAt(x, y, text, fg, bg)
   if bg then mon.setBackgroundColor(bg) end
   if fg then mon.setTextColor(fg) end
-  mon.setCursorPos(x,y); mon.write(text)
-  mon.setTextColor(colors.white); mon.setBackgroundColor(colors.black)
+  mon.setCursorPos(x, y)
+  mon.write(text)
 end
 
-local function fillLine(y,bg)
+-- Smooth header painter: writes full padded line; no clearLine().
+local function paintLine(y, bg, fg, s)
   local w,_ = mon.getSize()
-  mon.setCursorPos(1,y)
-  mon.setBackgroundColor(bg or colors.black)
-  mon.clearLine()
-  mon.setBackgroundColor(colors.black)
+  s = padRight(s, w)
+  mon.setCursorPos(1, y)
+  mon.setBackgroundColor(bg)
+  mon.setTextColor(fg)
+  mon.write(s)
 end
 
-local function inRect(x,y, rx,ry, rw,rh)
-  return x>=rx and x<=rx+rw-1 and y>=ry and y<=ry+rh-1
+local function inRect(x, y, rx, ry, rw, rh)
+  return x >= rx and x <= rx + rw - 1 and y >= ry and y <= ry + rh - 1
 end
 
--- ====== LAYOUTS ======
-local ui = { buttons = {}, cols = {}, w=0,h=0, tableTopY=5, footerY=0 }
-
+-- ====== LAYOUT ======
 local function computeLayoutDashboard()
   local w,h = mon.getSize()
-  ui.w, ui.h = w,h
+  state.ui.w, state.ui.h = w,h
 
-  local tableTopY = 5
-  local footerY = h
-  local maxRows = math.max(1, footerY - tableTopY - 1)
+  state.ui.tableTopY = 5
+  state.ui.footerY = h
+
+  local maxRows = math.max(1, state.ui.footerY - state.ui.tableTopY - 1)
   state.perPage = maxRows
 
-  -- IMPORTANT: do not remove buttons. We only ADD RESET RULE SCAN.
   local buttons = {
-    {id="ARM",    label= state.armed and "DISARM" or "ARM"},
-    {id="STOP",   label= state.screenStop and "CLEAR STOP" or "STOP"},
-    {id="RESET",  label= "RESET/RESUME"},
-    {id="RSCAN",  label= "RESET RULE SCAN"},
-    {id="QUERY",  label= "QUERY STATUS"},
-    {id="RULES",  label= "RULES"},
-    {id="PREV",   label= "<"},
-    {id="NEXT",   label= ">"},
+    { id="ARM",    label = state.armed and "DISARM" or "ARM" },
+    { id="STOP",   label = state.screenStop and "CLEAR STOP" or "STOP" },
+    { id="SCAN",   label = "RULE SCAN" },
+    { id="RESUME", label = "RESET/RESUME" },
+    { id="QUERY",  label = "QUERY" },
+    { id="RULES",  label = "RULES" },
+    { id="PREV",   label = "<" },
+    { id="NEXT",   label = ">" },
   }
 
   local bx = 2
-  for _,b in ipairs(buttons) do
+  for _, b in ipairs(buttons) do
     local bw = math.max(#b.label + 2, 8)
-    b.x,b.y,b.w,b.h = bx, 3, bw, 1
+    b.x, b.y, b.w, b.h = bx, 3, bw, 1
     bx = bx + bw + 1
   end
 
   local cols = {
-    {key="name",    title="Name",    min=16},
-    {key="mode",    title="Mode",    min=8},
-    {key="actual",  title="State",   min=5},
-    {key="desired", title="Want",    min=5},
-    {key="reason",  title="Reason",  min=10},
-    {key="hb",      title="HB",      min=5},
+    { key="name",    title="Name",   min=16 },
+    { key="mode",    title="Mode",   min=8  },
+    { key="actual",  title="State",  min=5  },
+    { key="desired", title="Want",   min=5  },
+    { key="reason",  title="Reason", min=10 },
+    { key="hb",      title="HB",     min=6  },
   }
 
   local sep = 1
   local function totalMin()
     local t = 2
-    for _,c in ipairs(cols) do t = t + c.min + sep end
+    for _, c in ipairs(cols) do t = t + c.min + sep end
     return t
   end
 
@@ -327,196 +441,143 @@ local function computeLayoutDashboard()
     table.remove(cols)
   end
 
-  for _,c in ipairs(cols) do c.w = c.min end
+  for _, c in ipairs(cols) do c.w = c.min end
   local extra = w - totalMin()
   if extra > 0 then
-    for _,c in ipairs(cols) do
+    for _, c in ipairs(cols) do
       if c.key == "reason" then c.w = c.w + extra end
     end
   end
 
   local x = 2
-  for _,c in ipairs(cols) do
+  for _, c in ipairs(cols) do
     c.x = x
     x = x + c.w + sep
   end
 
-  ui.buttons = buttons
-  ui.cols = cols
-  ui.tableTopY = tableTopY
-  ui.footerY = footerY
+  state.ui.buttons = buttons
+  state.ui.cols = cols
 end
 
 local function computeLayoutSlave()
   local w,h = mon.getSize()
-  ui.w, ui.h = w,h
+  state.ui.w, state.ui.h = w,h
 
   local buttons = {
-    {id="BACK",  label="BACK"},
-    {id="QUERY", label="QUERY"},
-    {id="AUTO",  label="AUTO"},
-    {id="FON",   label="FORCE ON"},
-    {id="FOFF",  label="FORCE OFF"},
+    { id="BACK",   label="BACK" },
+    { id="QUERY",  label="QUERY" },
+    { id="SCAN",   label="RULE SCAN" },
+    { id="RESUME", label="RESET/RESUME" },
+    { id="AUTO",   label="AUTO" },
+    { id="FON",    label="FORCE ON" },
+    { id="FOFF",   label="FORCE OFF" },
   }
 
   local bx = 2
-  for _,b in ipairs(buttons) do
+  for _, b in ipairs(buttons) do
     local bw = math.max(#b.label + 2, 8)
-    b.x,b.y,b.w,b.h = bx, 3, bw, 1
+    b.x, b.y, b.w, b.h = bx, 3, bw, 1
     bx = bx + bw + 1
   end
 
-  ui.buttons = buttons
+  state.ui.buttons = buttons
 end
 
 local function computeLayoutRules()
   local w,h = mon.getSize()
-  ui.w, ui.h = w,h
+  state.ui.w, state.ui.h = w,h
 
   local buttons = {
-    {id="BACK", label="BACK"},
-    {id="PREV", label="<"},
-    {id="NEXT", label=">"},
+    { id="BACK", label="BACK" },
+    { id="PREV", label="<" },
+    { id="NEXT", label=">" },
   }
 
   local bx = 2
-  for _,b in ipairs(buttons) do
+  for _, b in ipairs(buttons) do
     local bw = math.max(#b.label + 2, 6)
-    b.x,b.y,b.w,b.h = bx, 3, bw, 1
+    b.x, b.y, b.w, b.h = bx, 3, bw, 1
     bx = bx + bw + 1
   end
 
-  ui.buttons = buttons
+  state.ui.buttons = buttons
 end
 
--- ====== RENDER COMMON HEADER ======
-local function drawHeader()
-  computeLockoutReasons()
+-- ====== HEADER PAINT (DIFF-BASED) ======
+local function composeHeaderLine1()
+  local w,_ = mon.getSize()
+  local left = "Spawner Master"
+  local right = state.me.headerRight or "ME=??"
 
-  local w,h = mon.getSize()
-  ui.w, ui.h = w,h
+  -- place right aligned
+  local gap = w - (#left + #right)
+  if gap < 1 then
+    -- truncate right if too long
+    right = right:sub(1, math.max(0, w - #left - 1))
+    gap = 1
+  end
+  return left .. string.rep(" ", gap) .. right
+end
 
+local function headerTickPaint()
+  local w,_ = mon.getSize()
+
+  local l1 = composeHeaderLine1()
+  if l1 ~= state._lastHeaderLine1 then
+    paintLine(1, colors.gray, colors.black, l1)
+    state._lastHeaderLine1 = l1
+  end
+
+  local l2 = padRight(state.me.lockoutLine or "LOCKOUT: NONE", w)
+  if l2 ~= state._lastHeaderLine2 then
+    paintLine(2, state.me.lockoutBg, state.me.lockoutFg, l2)
+    state._lastHeaderLine2 = l2
+  end
+
+  -- restore defaults
   mon.setBackgroundColor(colors.black)
   mon.setTextColor(colors.white)
-  mon.clear()
-
-  fillLine(1, colors.gray)
-  writeAt(2,1,"Spawner Master", colors.black, colors.gray)
-
-  local right
-  if state.me.ok then
-    right = ("ME: %d%% (%d/%d)"):format(math.floor(state.me.pct*100 + 0.5), state.me.stored, state.me.cap)
-  else
-    right = "ME: ERR"
-  end
-  writeAt(math.max(2, w-#right-1), 1, right, colors.black, colors.gray)
-
-  if isLockedOut() then
-    fillLine(2, colors.red)
-    writeAt(2,2,"LOCKOUT: " .. table.concat(state.lockoutReasons, " | "), colors.white, colors.red)
-  else
-    fillLine(2, colors.green)
-    writeAt(2,2,"LOCKOUT: NONE", colors.black, colors.green)
-  end
 end
 
+-- ====== BUTTONS DRAW ======
 local function drawButtons()
-  for _,b in ipairs(ui.buttons) do
+  for _, b in ipairs(state.ui.buttons) do
     local bg, fg = colors.lightGray, colors.black
+
     if b.id == "ARM" then bg = state.armed and colors.orange or colors.lime end
     if b.id == "STOP" then bg = colors.red; fg = colors.white end
-    if b.id == "RESET" then bg = colors.cyan; fg = colors.black end
-    if b.id == "RSCAN" then bg = colors.lightBlue; fg = colors.black end
+    if b.id == "SCAN" then bg = colors.cyan; fg = colors.black end
+    if b.id == "RESUME" then bg = colors.purple; fg = colors.white end
     if b.id == "QUERY" then bg = colors.yellow; fg = colors.black end
     if b.id == "RULES" then bg = colors.lightBlue; fg = colors.black end
     if b.id == "PREV" or b.id == "NEXT" then bg = colors.gray; fg = colors.white end
 
     if b.id == "BACK" then bg = colors.gray; fg = colors.white end
     if b.id == "AUTO" then bg = colors.lime; fg = colors.black end
-    if b.id == "FON" then bg = colors.orange; fg = colors.black end
-    if b.id == "FOFF" then bg = colors.orange; fg = colors.black end
+    if b.id == "FON" or b.id == "FOFF" then bg = colors.orange; fg = colors.black end
 
-    writeAt(b.x,b.y, padRight(b.label, b.w), fg, bg)
+    writeAt(b.x, b.y, padRight(b.label, b.w), fg, bg)
   end
+  mon.setBackgroundColor(colors.black)
+  mon.setTextColor(colors.white)
 end
 
--- ====== DESIRED STATE ENGINE ======
--- Rules not implemented yet. AUTO defaults to OFF.
-local function computeDesiredForSlave(name)
-  local sc = cfg.slave_cfg[name] or { mode="AUTO", rules={on_any={}, off_all={}} }
-  local mode = sc.mode or "AUTO"
-
-  -- Global gates: lockout or disarmed always forces OFF.
-  if isLockedOut() or (not state.armed) then
-    return "OFF", "GLOBAL"
-  end
-
-  if mode == "FORCEOFF" then
-    return "OFF", "FORCEOFF"
-  elseif mode == "FORCEON" then
-    return "ON", "FORCEON"
-  else
-    -- AUTO placeholder: do nothing yet => keep OFF.
-    return "OFF", "AUTO"
-  end
+-- ====== FULL PAGE DRAWS ======
+local function fullClearOnce()
+  mon.setBackgroundColor(colors.black)
+  mon.setTextColor(colors.white)
+  mon.clear()
+  state._lastHeaderLine1 = nil
+  state._lastHeaderLine2 = nil
 end
 
-local function applyDesiredAll()
-  -- Compute desired and send CMD only when it changes.
-  for _,name in ipairs(cfg.slaves) do
-    local want, why = computeDesiredForSlave(name)
-    state.desired[name] = want
-
-    local st = state.status[name]
-    if not st then
-      state.status[name] = { }
-      st = state.status[name]
-    end
-
-    if isLockedOut() then
-      st.reason = "LOCKOUT"
-    elseif not state.armed then
-      st.reason = "DISARM"
-    else
-      if not st.reason or st.reason == "" or st.reason == "LOCKOUT" or st.reason == "DISARM" then
-        st.reason = why
-      end
-    end
-
-    if state.lastCmd[name] ~= want then
-      sendToSlave(name, "CMD", want)
-      state.lastCmd[name] = want
-    end
-  end
-end
-
--- Heartbeat sender: keep ON slaves alive.
--- Slaves fail-safe OFF if heartbeat stops.
-local HB_PERIOD = 4.8
-local function heartbeatLoop()
-  while true do
-    computeLockoutReasons()
-
-    if (not isLockedOut()) and state.armed then
-      for _,name in ipairs(cfg.slaves) do
-        if state.lastCmd[name] == "ON" then
-          sendToSlave(name, "HB", "1")
-        end
-      end
-    end
-
-    sleep(HB_PERIOD)
-  end
-end
-
--- ====== DASHBOARD PAGE ======
-local ui = ui -- (already declared above)
-local function drawDashboard()
+local function drawDashboardFull()
   computeLayoutDashboard()
-  drawHeader()
+  fullClearOnce()
+  headerTickPaint()
   drawButtons()
 
-  for _,c in ipairs(ui.cols) do
+  for _, c in ipairs(state.ui.cols) do
     writeAt(c.x, 4, padRight(c.title, c.w), colors.cyan, colors.black)
   end
 
@@ -524,87 +585,110 @@ local function drawDashboard()
   local pages = math.max(1, math.ceil(total / state.perPage))
   state.page = clamp(state.page, 1, pages)
 
-  local startIdx = (state.page-1)*state.perPage + 1
+  local startIdx = (state.page - 1) * state.perPage + 1
   local endIdx = math.min(total, startIdx + state.perPage - 1)
 
-  local y = ui.tableTopY
+  local y = state.ui.tableTopY
   for i = startIdx, endIdx do
     local name = cfg.slaves[i]
     local st = state.status[name] or {}
-
     local mode = (cfg.slave_cfg[name] and cfg.slave_cfg[name].mode) or "AUTO"
 
     local row = {
       name = name,
       mode = mode,
       actual = st.actual or "--",
-      desired = state.desired[name] or "--",
+      desired = st.desired or state.rule.lastDesired[name] or "--",
       reason = st.reason or (isLockedOut() and "LOCKOUT" or "--"),
-      hb = st.hbAge or "--"
+      hb = st.hbAge or "--",
     }
 
     local selected = (state.selectedIndex == i)
     local bg = selected and colors.gray or colors.black
     local fg = selected and colors.black or colors.white
 
-    for _,c in ipairs(ui.cols) do
+    for _, c in ipairs(state.ui.cols) do
       writeAt(c.x, y, padRight(row[c.key] or "", c.w), fg, bg)
     end
     y = y + 1
   end
 
   local foot = ("Page %d/%d  (%d-%d of %d)"):format(state.page, pages, startIdx, endIdx, total)
-  writeAt(2, ui.footerY, foot, colors.gray, colors.black)
+  writeAt(2, state.ui.footerY, padRight(foot, state.ui.w), colors.gray, colors.black)
+  mon.setBackgroundColor(colors.black)
+  mon.setTextColor(colors.white)
 end
 
--- ====== SLAVE DETAIL PAGE ======
-local function drawSlaveDetail()
+local function drawSlaveFull()
   computeLayoutSlave()
-  drawHeader()
+  fullClearOnce()
+  headerTickPaint()
   drawButtons()
 
   local w,h = mon.getSize()
   local name = state.selectedName
   if not name then
-    writeAt(2,5,"No slave selected. Tap a row first.", colors.red)
+    writeAt(2, 5, "No slave selected. Tap a row first.", colors.red, colors.black)
     return
   end
 
   local sc = cfg.slave_cfg[name] or { mode="AUTO", rules={on_any={}, off_all={}} }
   local st = state.status[name] or {}
 
-  writeAt(2,5, ("Slave: %s"):format(name), colors.white)
-  writeAt(2,6, ("Mode: %s"):format(sc.mode or "AUTO"), colors.white)
-  writeAt(2,7, ("State: %s   Want: %s"):format(st.actual or "--", state.desired[name] or "--"), colors.white)
-  writeAt(2,8, ("Reason: %s"):format(st.reason or "--"), colors.white)
+  local age = "--"
+  if state.rule.lastScanAt then
+    age = string.format("%.1fs", now() - state.rule.lastScanAt)
+  end
 
-  writeAt(2,10,"ON triggers (OR):", colors.cyan)
-  local y = 11
+  writeAt(2,5, ("Slave: %s"):format(name), colors.white, colors.black)
+  writeAt(2,6, ("Mode: %s"):format(sc.mode or "AUTO"), colors.white, colors.black)
+  writeAt(2,7, ("State: %s   Want: %s"):format(st.actual or "--", st.desired or state.rule.lastDesired[name] or "--"), colors.white, colors.black)
+  writeAt(2,8, ("Reason: %s"):format(st.reason or "--"), colors.white, colors.black)
+  writeAt(2,9, ("Rule scan age: %s"):format(age), colors.gray, colors.black)
+
+  writeAt(2,11, "ON triggers (OR):  (ANY item < low)", colors.cyan, colors.black)
+  local y = 12
   local shown = 0
-  for _,r in ipairs(sc.rules.on_any or {}) do
+  for _, r in ipairs(sc.rules.on_any or {}) do
     if y >= h-1 then break end
-    writeAt(2,y, ("- %s < %s"):format(tostring(r.item), tostring(r.low)), colors.white); y=y+1; shown=shown+1
+    local cnt = countOf(r.item)
+    local line = string.format("- %s  cnt=%d  < %s", tostring(r.item), tonumber(cnt) or 0, tostring(r.low))
+    writeAt(2,y, padRight(line, w-1), colors.white, colors.black)
+    y=y+1; shown=shown+1
   end
-  if shown == 0 then writeAt(2,y,"(none)", colors.gray); y=y+1 end
+  if shown == 0 then
+    writeAt(2,y, "(none)", colors.gray, colors.black)
+    y=y+1
+  end
 
-  writeAt(2,y+1,"OFF triggers (AND):", colors.cyan); y=y+2
+  y = y + 1
+  writeAt(2,y, "OFF triggers (AND): (ALL items > high)", colors.cyan, colors.black)
+  y=y+1
   shown = 0
-  for _,r in ipairs(sc.rules.off_all or {}) do
+  for _, r in ipairs(sc.rules.off_all or {}) do
     if y >= h-1 then break end
-    writeAt(2,y, ("- %s > %s"):format(tostring(r.item), tostring(r.high)), colors.white); y=y+1; shown=shown+1
+    local cnt = countOf(r.item)
+    local line = string.format("- %s  cnt=%d  > %s", tostring(r.item), tonumber(cnt) or 0, tostring(r.high))
+    writeAt(2,y, padRight(line, w-1), colors.white, colors.black)
+    y=y+1; shown=shown+1
   end
-  if shown == 0 then writeAt(2,y,"(none)", colors.gray) end
+  if shown == 0 then
+    writeAt(2,y, "(none)", colors.gray, colors.black)
+  end
+
+  mon.setBackgroundColor(colors.black)
+  mon.setTextColor(colors.white)
 end
 
--- ====== RULES PAGE (READ-ONLY VIEW) ======
-local function drawRules()
+local function drawRulesFull()
   computeLayoutRules()
-  drawHeader()
+  fullClearOnce()
+  headerTickPaint()
   drawButtons()
 
   local w,h = mon.getSize()
-  writeAt(2,5,"RULES (read-only). Edit via terminal editor program.", colors.white)
-  writeAt(2,6,("ME cutoff: %d%%"):format(math.floor((cfg.me.cutoffPct or 0)*100 + 0.5)), colors.white)
+  writeAt(2,5, "RULES (read-only). Edit via terminal rule configurator.", colors.white, colors.black)
+  writeAt(2,6, ("ME min pct cutoff: %.0f%%"):format((cfg.me.minPct or ME_MIN_PCT)*100), colors.white, colors.black)
 
   local rowsTop = 8
   local per = math.max(1, h - rowsTop - 2)
@@ -612,10 +696,10 @@ local function drawRules()
   local pages = math.max(1, math.ceil(total / per))
   state.rulesPage = clamp(state.rulesPage, 1, pages)
 
-  local startIdx = (state.rulesPage-1)*per + 1
+  local startIdx = (state.rulesPage - 1) * per + 1
   local endIdx = math.min(total, startIdx + per - 1)
 
-  writeAt(2,7,"Name                Mode      on_any  off_all", colors.cyan)
+  writeAt(2,7, "Name                Mode      on_any  off_all", colors.cyan, colors.black)
   local y = rowsTop
   for i = startIdx, endIdx do
     local name = cfg.slaves[i]
@@ -623,89 +707,56 @@ local function drawRules()
     local onN = #(sc.rules.on_any or {})
     local offN = #(sc.rules.off_all or {})
     local line = padRight(name, 18) .. " " .. padRight(sc.mode or "AUTO", 8) .. "  " .. padRight(onN, 6) .. " " .. padRight(offN, 6)
-    writeAt(2,y,line, colors.white); y=y+1
+    writeAt(2,y, padRight(line, w-1), colors.white, colors.black)
+    y=y+1
   end
 
   local foot = ("Rules page %d/%d  (%d-%d of %d)"):format(state.rulesPage, pages, startIdx, endIdx, total)
-  writeAt(2, h, foot, colors.gray)
+  writeAt(2,h, padRight(foot, w-1), colors.gray, colors.black)
+
+  mon.setBackgroundColor(colors.black)
+  mon.setTextColor(colors.white)
+end
+
+local function fullRedraw()
+  if state.pageName == "DASH" then
+    drawDashboardFull()
+  elseif state.pageName == "SLAVE" then
+    drawSlaveFull()
+  elseif state.pageName == "RULES" then
+    drawRulesFull()
+  end
 end
 
 -- ====== ACTIONS ======
-local function forceAllOff()
-  for _,name in ipairs(cfg.slaves) do
-    sendToSlave(name, "CMD", "OFF")
-    state.lastCmd[name] = "OFF"
-  end
-end
-
 local function doArmToggle()
   state.armed = not state.armed
   cfg.globalAllow = state.armed
-  save(cfg)
-  if not state.armed then
-    forceAllOff()
-  end
+  saveCfg(cfg)
+  computeLockoutStrings()
+  if not state.armed then forceAllOff() end
 end
 
 local function doStopToggle()
   state.screenStop = not state.screenStop
   cfg.interlocks.screenStop = state.screenStop
-  save(cfg)
-  if state.screenStop then
-    forceAllOff()
-  end
+  saveCfg(cfg)
+  computeLockoutStrings()
+  if state.screenStop then forceAllOff() end
 end
 
-local function doResetResume()
-  -- Operator intent: "issues cleared, re-apply modes".
-  -- Does NOT clear STOP latch. Use CLEAR STOP for that.
-  if isLockedOut() then return end
-  if not state.armed then return end
+local function doRuleScanNow()
+  state.rule.scanNow = true
+  state.rule.nextScanAt = 0
+end
+
+local function doResumeNow()
+  for _, name in ipairs(cfg.slaves) do
+    state.rule.lastSent[name] = nil -- allow resend
+  end
+  sendResumeAll()
+  doRuleScanNow()
   requestStatusAll()
-  applyDesiredAll()
-end
-
-local function doResetRuleScan()
-  -- Reload config from disk + reattach bridge.
-  -- Useful after you edit master.cfg via terminal tools.
-  local newCfg = load()
-  if newCfg then
-    cfg = newCfg
-
-    -- normalize required tables
-    cfg.slaves = cfg.slaves or {}
-    cfg.key = cfg.key or ""
-    cfg.globalAllow = cfg.globalAllow ~= false
-    cfg.me = cfg.me or { cutoffPct = 0.50, cutoffAbs = 0 }
-    cfg.interlocks = cfg.interlocks or { screenStop = false }
-    cfg.slave_cfg = cfg.slave_cfg or {}
-    for _,name in ipairs(cfg.slaves) do
-      cfg.slave_cfg[name] = cfg.slave_cfg[name] or { mode = "AUTO", rules = { on_any = {}, off_all = {} } }
-    end
-
-    -- keep runtime toggles consistent with config
-    state.armed = cfg.globalAllow
-    state.screenStop = cfg.interlocks.screenStop or state.screenStop
-
-    -- selection might now be invalid
-    if state.selectedName then
-      local ok = false
-      for _,n in ipairs(cfg.slaves) do if n == state.selectedName then ok = true break end end
-      if not ok then
-        state.selectedName = nil
-        state.selectedIndex = nil
-        state.pageName = "DASH"
-      end
-    end
-
-    -- reattach peripherals / refresh ME telemetry
-    initBridge()
-    readMePower()
-
-    -- refresh slave status + desired
-    requestStatusAll()
-    applyDesiredAll()
-  end
 end
 
 local function gotoPage(name)
@@ -714,10 +765,10 @@ end
 
 local function setSlaveMode(slaveName, mode)
   if not slaveName then return end
-  cfg.slave_cfg[slaveName] = cfg.slave_cfg[slaveName] or { mode="AUTO", rules={on_any={}, off_all={}} }
+  cfg.slave_cfg[slaveName] = cfg.slave_cfg[slaveName] or { mode = "AUTO", rules = { on_any = {}, off_all = {} } }
   cfg.slave_cfg[slaveName].mode = mode
-  save(cfg)
-  applyDesiredAll()
+  saveCfg(cfg)
+  doRuleScanNow()
 end
 
 -- ====== RECEIVER LOOP ======
@@ -726,7 +777,7 @@ local function receiverLoop()
     local sender, msg = rednet.receive(PROTOCOL, 0.5)
     if sender and type(msg) == "table" and msg.slave and msg.kind then
       local vpart = msg.valueStr or tostring(msg.value or "")
-      local payload = (msg.kind or "").."|"..(msg.slave or "").."|"..vpart
+      local payload = (msg.kind or "") .. "|" .. (msg.slave or "") .. "|" .. vpart
       if msg.s == sig(cfg.key, payload) then
         if msg.kind == "STATUS_RSP" then
           local name = msg.slave
@@ -740,118 +791,203 @@ local function receiverLoop()
           else
             state.status[name].reason = tostring(v)
           end
-          state.status[name].last = os.clock()
+          state.status[name].last = now()
         end
       end
     end
 
-    for _,name in ipairs(cfg.slaves) do
+    for _, name in ipairs(cfg.slaves) do
       local st = state.status[name]
       if st and st.last then
-        st.hbAge = string.format("%.1fs", os.clock() - st.last)
+        st.hbAge = string.format("%.1fs", now() - st.last)
       end
     end
   end
 end
 
--- ====== CONTROL LOOP ======
-local function controlLoop()
-  for _,name in ipairs(cfg.slaves) do
-    state.lastCmd[name] = state.lastCmd[name] or "OFF"
-    state.desired[name] = state.desired[name] or "OFF"
-  end
-
-  requestStatusAll()
-
+-- ====== HEARTBEAT LOOP ======
+local function heartbeatLoop()
   while true do
-    computeLockoutReasons()
-
-    if isLockedOut() and (not state.wasLockedOut) then
-      forceAllOff()
-    end
-    state.wasLockedOut = isLockedOut()
-
-    applyDesiredAll()
-
-    sleep(0.5)
+    sendAckAll()
+    sleep(HEARTBEAT_SEC)
   end
 end
 
--- ====== TOUCH HANDLERS ======
-local function handleButtons(x,y)
-  for _,b in ipairs(ui.buttons) do
-    if inRect(x,y, b.x,b.y,b.w,b.h) then
-      if state.pageName == "DASH" then
-        if b.id == "ARM" then doArmToggle()
-        elseif b.id == "STOP" then doStopToggle()
-        elseif b.id == "RESET" then doResetResume()
-        elseif b.id == "RSCAN" then doResetRuleScan()
-        elseif b.id == "QUERY" then requestStatusAll()
-        elseif b.id == "RULES" then gotoPage("RULES")
-        elseif b.id == "PREV" then state.page = math.max(1, state.page - 1)
-        elseif b.id == "NEXT" then state.page = state.page + 1
-        end
-        return true
-      elseif state.pageName == "SLAVE" then
-        local name = state.selectedName
-        if b.id == "BACK" then gotoPage("DASH")
-        elseif b.id == "QUERY" then requestStatusOne(name)
-        elseif b.id == "AUTO" then setSlaveMode(name, "AUTO")
-        elseif b.id == "FON" then setSlaveMode(name, "FORCEON")
-        elseif b.id == "FOFF" then setSlaveMode(name, "FORCEOFF")
-        end
-        return true
-      elseif state.pageName == "RULES" then
-        if b.id == "BACK" then gotoPage("DASH")
-        elseif b.id == "PREV" then state.rulesPage = math.max(1, state.rulesPage - 1)
-        elseif b.id == "NEXT" then state.rulesPage = state.rulesPage + 1
-        end
-        return true
+-- ====== STATUS POLL LOOP ======
+local function statusPollLoop()
+  while true do
+    requestStatusAll()
+    sleep(STATUS_POLL_SEC)
+  end
+end
+
+-- ====== ME POLL LOOP (CACHED) ======
+local function mePollLoop()
+  while true do
+    -- re-attach bridge if it was missing / got reconnected
+    if not bridge then bridge = tryAttachBridge() end
+
+    if bridge then
+      local stored = safeCall(bridge.getStoredEnergy)
+      local cap    = safeCall(bridge.getEnergyCapacity)
+
+      if type(stored) ~= "number" or type(cap) ~= "number" then
+        stored = safeCall(bridge.getEnergyStorage)
+        cap    = safeCall(bridge.getMaxEnergyStorage)
       end
-    end
-  end
-  return false
-end
 
-local function handleRowTapDashboard(x,y)
-  local rowY0 = ui.tableTopY
-  local idxOnPage = y - rowY0 + 1
-  if idxOnPage < 1 or idxOnPage > state.perPage then return false end
-
-  local total = #cfg.slaves
-  local pages = math.max(1, math.ceil(total / state.perPage))
-  state.page = clamp(state.page, 1, pages)
-
-  local startIdx = (state.page-1)*state.perPage + 1
-  local i = startIdx + (idxOnPage-1)
-  if i < 1 or i > total then return false end
-
-  state.selectedIndex = i
-  state.selectedName = cfg.slaves[i]
-  gotoPage("SLAVE")
-  return true
-end
-
--- ====== UI LOOP ======
-local function uiLoop()
-  while true do
-    if state.pageName == "DASH" then
-      drawDashboard()
-    elseif state.pageName == "SLAVE" then
-      drawSlaveDetail()
-    elseif state.pageName == "RULES" then
-      drawRules()
-    end
-
-    local _, _, x, y = os.pullEvent("monitor_touch")
-    if handleButtons(x,y) then
-      -- handled
+      if type(stored) == "number" and type(cap) == "number" and cap > 0 then
+        state.me.stored = stored
+        state.me.cap = cap
+        state.me.pct = stored / cap
+        state.me.headerRight = ("ME=%.0f%%  (%d/%d)"):format(state.me.pct * 100, stored, cap)
+      else
+        state.me.pct = nil
+        state.me.headerRight = "ME=?? (bridge?)"
+      end
     else
+      state.me.pct = nil
+      state.me.headerRight = "ME=?? (bridge?)"
+    end
+
+    computeLockoutStrings()
+    sleep(ME_POLL_SEC)
+  end
+end
+
+-- ====== RULE ENGINE LOOP ======
+local function ruleLoop()
+  state.rule.scanNow = true
+  state.rule.nextScanAt = 0
+
+  while true do
+    local t = now()
+
+    if state.rule.scanNow or t >= (state.rule.nextScanAt or 0) then
+      state.rule.scanNow = false
+      state.rule.nextScanAt = t + RULE_TICK_SEC
+
+      scanAllTrackedItems()
+
+      for _, slave in ipairs(cfg.slaves) do
+        local desired, why = computeDesiredForSlave(slave)
+        applyDesired(slave, desired, why)
+      end
+
+      if isLockedOut() then
+        forceAllOff()
+      end
+    end
+
+    sleep(0.1)
+  end
+end
+
+-- ====== UI LOOP (EVENT DRIVEN) ======
+local function uiLoop()
+  -- prime lastDesired/sent
+  for _, name in ipairs(cfg.slaves) do
+    state.rule.lastDesired[name] = state.rule.lastDesired[name] or "OFF"
+    state.rule.lastSent[name] = nil
+  end
+
+  fullRedraw()
+
+  local tUI = os.startTimer(UI_REFRESH_SEC)
+
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+
+    if ev == "timer" and p1 == tUI then
+      tUI = os.startTimer(UI_REFRESH_SEC)
+      -- header only (diff-based)
+      headerTickPaint()
+
+    elseif ev == "monitor_touch" then
+      local x, y = p2, p3
+
+      -- Ensure layout for current page exists before hit test
       if state.pageName == "DASH" then
-        handleRowTapDashboard(x,y)
+        computeLayoutDashboard()
+      elseif state.pageName == "SLAVE" then
+        computeLayoutSlave()
+      else
+        computeLayoutRules()
+      end
+
+      local changed = false
+
+      -- buttons
+      for _, b in ipairs(state.ui.buttons) do
+        if inRect(x, y, b.x, b.y, b.w, b.h) then
+          if state.pageName == "DASH" then
+            if b.id == "ARM" then doArmToggle(); changed = true
+            elseif b.id == "STOP" then doStopToggle(); changed = true
+            elseif b.id == "SCAN" then doRuleScanNow(); changed = false -- no need full redraw
+            elseif b.id == "RESUME" then doResumeNow(); changed = false
+            elseif b.id == "QUERY" then requestStatusAll(); changed = false
+            elseif b.id == "RULES" then gotoPage("RULES"); changed = true
+            elseif b.id == "PREV" then state.page = math.max(1, state.page - 1); changed = true
+            elseif b.id == "NEXT" then state.page = state.page + 1; changed = true
+            end
+          elseif state.pageName == "SLAVE" then
+            local name = state.selectedName
+            if b.id == "BACK" then gotoPage("DASH"); changed = true
+            elseif b.id == "QUERY" then requestStatusOne(name); changed = false
+            elseif b.id == "SCAN" then doRuleScanNow(); changed = false
+            elseif b.id == "RESUME" then doResumeNow(); changed = false
+            elseif b.id == "AUTO" then setSlaveMode(name, "AUTO"); changed = true
+            elseif b.id == "FON" then setSlaveMode(name, "FORCEON"); changed = true
+            elseif b.id == "FOFF" then setSlaveMode(name, "FORCEOFF"); changed = true
+            end
+          else -- RULES
+            if b.id == "BACK" then gotoPage("DASH"); changed = true
+            elseif b.id == "PREV" then state.rulesPage = math.max(1, state.rulesPage - 1); changed = true
+            elseif b.id == "NEXT" then state.rulesPage = state.rulesPage + 1; changed = true
+            end
+          end
+          break
+        end
+      end
+
+      -- row tap (dashboard)
+      if not changed and state.pageName == "DASH" then
+        local rowY0 = state.ui.tableTopY
+        local idxOnPage = y - rowY0 + 1
+        if idxOnPage >= 1 and idxOnPage <= state.perPage then
+          local total = #cfg.slaves
+          local pages = math.max(1, math.ceil(total / state.perPage))
+          state.page = clamp(state.page, 1, pages)
+          local startIdx = (state.page - 1) * state.perPage + 1
+          local i = startIdx + (idxOnPage - 1)
+          if i >= 1 and i <= total then
+            state.selectedIndex = i
+            state.selectedName = cfg.slaves[i]
+            gotoPage("SLAVE")
+            changed = true
+          end
+        end
+      end
+
+      if changed then
+        fullRedraw()
+      else
+        -- minimal visual refresh only
+        headerTickPaint()
       end
     end
   end
 end
 
-parallel.waitForAny(uiLoop, receiverLoop, controlLoop, heartbeatLoop)
+-- ====== STARTUP ======
+computeLockoutStrings()
+requestStatusAll()
+
+parallel.waitForAny(
+  uiLoop,
+  receiverLoop,
+  ruleLoop,
+  heartbeatLoop,
+  statusPollLoop,
+  mePollLoop
+)
