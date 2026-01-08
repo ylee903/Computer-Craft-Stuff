@@ -1,13 +1,16 @@
--- client.lua
--- Local: player detector decides "allowed player online"
--- Hub: only provides redstone level wakeups + level payload
--- Rule: if hub level > 14, output is forced OFF
+-- client.lua (FAIL-SAFE)
+-- If hub can't be reached: assume BLOCKED, force output OFF.
+-- Keeps checking periodically for hub to appear.
 
 local PROTO    = "sam_hub_v1"
-local HUB_NAME = "MainHub"  -- set nil to accept any hub name
+local HUB_NAME = "MainHub"   -- nil = accept any
 
 local LEVER_SIDE  = "left"
 local OUTPUT_SIDE = "bottom"
+
+-- retry timings
+local DISCOVER_RETRY_SEC = 10   -- try to find hub every 10s if missing
+local QUERY_TIMEOUT_SEC  = 2    -- wait up to 2s for hub replies
 
 -- Players allowed to enable output (LOCAL check)
 local allowedPlayers = {
@@ -43,53 +46,72 @@ local function openAllModems()
 end
 openAllModems()
 
--- ===== Hub discovery / subscription =====
+-- ===== Hub state =====
 local hubId = nil
-local hubLevel = nil -- last known hub analog level (0-15)
+local hubLevel = nil     -- last known hub level
+local hubBlocked = true  -- FAIL-SAFE DEFAULT: blocked until proven otherwise
 
-local function discoverHub()
-  print("Discovering hub...")
+-- ===== Hub helpers =====
+local function discoverHub(timeoutSec)
   rednet.broadcast({ type = "hub_discover" }, PROTO)
 
+  local deadline = os.clock() + (timeoutSec or 0)
   while true do
-    local sender, msg = rednet.receive(PROTO)
-    if type(msg) == "table" and (msg.type == "hub_here" or msg.type == "hub_announce") then
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return false end
+
+    local sender, msg = rednet.receive(PROTO, remaining)
+    if sender and type(msg) == "table" and (msg.type == "hub_here" or msg.type == "hub_announce") then
       if HUB_NAME == nil or msg.name == HUB_NAME then
         hubId = sender
-        print(("Hub found: id=%d name=%s"):format(hubId, tostring(msg.name)))
-        return
+        return true
       end
     end
   end
 end
 
 local function registerRedstoneOnly()
-  print("Registering: hub redstone wakeups only...")
-  rednet.send(hubId, {
-    type = "register",
-    subs = {
-      redstone = { anyChange = true }
-      -- NOTE: no players subscription
-    }
-  }, PROTO)
-
-  -- Optional ack (debug)
-  local sender, msg = rednet.receive(PROTO, 3)
+  if not hubId then return end
+  rednet.send(hubId, { type = "register", subs = { redstone = { anyChange = true } } }, PROTO)
+  -- ack optional
+  local sender, msg = rednet.receive(PROTO, 2)
   if sender == hubId and type(msg) == "table" and msg.type == "ok" then
     print("Hub ack:", msg.msg or "(ok)")
-  else
-    print("No ack seen (continuing anyway).")
   end
 end
 
-local function queryHubLevel(timeout)
+local function queryHubLevel(timeoutSec)
+  if not hubId then return nil end
   rednet.send(hubId, { type = "query", q = "level" }, PROTO)
 
-  local sender, msg = rednet.receive(PROTO, timeout or 2)
+  local sender, msg = rednet.receive(PROTO, timeoutSec or QUERY_TIMEOUT_SEC)
   if sender == hubId and type(msg) == "table" and msg.type == "level" then
     return msg.level
   end
   return nil
+end
+
+local function bindHubIfPossible(reason)
+  -- try find hub quickly; if found, register and fetch level
+  if not hubId then
+    local ok = discoverHub(QUERY_TIMEOUT_SEC)
+    if not ok then
+      return false
+    end
+    print(("Hub found (reason=%s) id=%d"):format(reason or "?", hubId))
+    registerRedstoneOnly()
+  end
+
+  local lvl = queryHubLevel(QUERY_TIMEOUT_SEC)
+  if lvl == nil then
+    -- hub exists but didn't answer query (could be unloading); remain fail-safe
+    return false
+  end
+
+  hubLevel = lvl
+  hubBlocked = (hubLevel > 14)  -- if 15, blocked; otherwise not blocked
+  print(("Hub level now %d => %s"):format(hubLevel, hubBlocked and "BLOCKED" or "allowed"))
+  return true
 end
 
 -- ===== Output logic =====
@@ -97,83 +119,94 @@ local function decideOutput()
   local leverOn  = redstone.getInput(LEVER_SIDE)
   local okPlayer = allowedPlayerOnline()
 
-  -- Hub gate: >14 blocks output
-  if hubLevel ~= nil and hubLevel > 14 then
-    return false, ("BLOCKED (hub level %d > 14)"):format(hubLevel)
+  -- FAIL-SAFE GATE:
+  -- If hub unreachable OR hub says >14 => force OFF.
+  if hubBlocked then
+    return false, (hubLevel == nil)
+      and "BLOCKED (hub unreachable/unknown => fail-safe OFF)"
+      or ("BLOCKED (hub level "..hubLevel.." > 14)")
   end
 
   local out = leverOn and okPlayer
   if out then
-    return true, "ON (lever ON + allowed player online + hub not >14)"
+    return true, "ON (lever ON + allowed player online + hub allows)"
   else
     return false, "OFF (lever OFF or no allowed player online)"
   end
 end
 
 local function applyOutput(tag)
-  -- If we don't know hubLevel yet, fetch once (so blocking works immediately)
-  if hubLevel == nil and hubId then
-    local lvl = queryHubLevel(2)
-    if lvl ~= nil then
-      hubLevel = lvl
-      print(("Fetched hub level: %d"):format(hubLevel))
-    else
-      print("Warning: hub level unknown; treating as not blocked until received.")
-    end
-  end
-
   local out, reason = decideOutput()
   redstone.setOutput(OUTPUT_SIDE, out)
   print(("[%s] Output %s - %s"):format(tag or "update", out and "ON" or "OFF", reason))
 end
 
--- ===== Startup =====
-discoverHub()
-registerRedstoneOnly()
+-- ===== Startup behaviour =====
+print("Startup: fail-safe default = BLOCKED until hub responds.")
+redstone.setOutput(OUTPUT_SIDE, false)
 
-hubLevel = queryHubLevel(2) or hubLevel
-if hubLevel ~= nil then
-  print(("Initial hub level: %d"):format(hubLevel))
+-- Try once on startup, but DO NOT hang if hub isn't loaded.
+if bindHubIfPossible("startup") then
+  -- we now have a real hub state
 else
-  print("Initial hub level unknown.")
+  -- remain fail-safe blocked
+  hubBlocked = true
+  hubLevel = nil
+  print("Hub not reachable at startup => staying BLOCKED (fail-safe).")
 end
 
 applyOutput("startup")
 
--- ===== Unified event loop =====
+-- ===== Main loop =====
+local retryTimer = os.startTimer(DISCOVER_RETRY_SEC)
+
 while true do
   local event, p1, p2, p3 = os.pullEvent()
 
-  if event == "rednet_message" then
+  if event == "timer" and p1 == retryTimer then
+    -- periodically try to (re)bind the hub if blocked/unknown
+    if hubId == nil or hubLevel == nil then
+      if bindHubIfPossible("periodic") then
+        applyOutput("hub_recovered")
+      end
+    end
+    retryTimer = os.startTimer(DISCOVER_RETRY_SEC)
+
+  elseif event == "rednet_message" then
     local sender, msg, proto = p1, p2, p3
     if proto == PROTO and type(msg) == "table" then
-      -- Rebind hub if it re-announces (hub reboot)
+      -- hub announce/here can (re)bind after reboot
       if (msg.type == "hub_here" or msg.type == "hub_announce") and (HUB_NAME == nil or msg.name == HUB_NAME) then
         if hubId ~= sender then
           hubId = sender
-          print(("Hub (re)bound: id=%d name=%s"):format(hubId, tostring(msg.name)))
+          print(("Hub (re)bound via announce: id=%d"):format(hubId))
           registerRedstoneOnly()
-          hubLevel = queryHubLevel(2) or hubLevel
+          -- fetch latest level; if fails, stay fail-safe
+          if not bindHubIfPossible("announce") then
+            hubBlocked = true
+            hubLevel = nil
+          end
           applyOutput("hub_rebind")
         end
       end
 
-      -- Redstone wake event from hub
+      -- redstone event from hub updates gating immediately
       if sender == hubId and msg.type == "event" and msg.event == "redstone" then
         hubLevel = msg.level
-        print(("Wake: hub redstone %s prev=%s level=%s"):format(
-          tostring(msg.side), tostring(msg.prev), tostring(msg.level)
+        hubBlocked = (hubLevel > 14)
+        print(("Wake: hub redstone prev=%s level=%s => %s"):format(
+          tostring(msg.prev), tostring(msg.level), hubBlocked and "BLOCKED" or "allowed"
         ))
         applyOutput("hub_redstone")
       end
     end
 
   elseif event == "redstone" then
-    -- Local lever change
+    -- local lever
     applyOutput("local_redstone")
 
   elseif event == "playerJoin" or event == "playerLeave" then
-    -- Local player detector events
+    -- local player detector events
     applyOutput("local_" .. event)
   end
 end
