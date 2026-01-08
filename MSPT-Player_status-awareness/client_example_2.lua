@@ -1,12 +1,12 @@
--- startup.lua (Client)
+-- startup.lua (Client) — improved
 -- CC:Tweaked + Ender modem
 --
--- Sleeps until HUB wakes us (PROTO-filtered) on:
---  - redstone enter/exit level 15
---  - any player join/leave
--- Then queries hub state and sets redstone output on BACK:
---  ON  if (hub level == 15) AND ("Samuel12345678" is online)
---  OFF otherwise
+-- Behavior:
+--  - Subscribe to hub events (PROTO-filtered).
+--  - Do ONE initial state query to sync caches.
+--  - On REDSTONE wake: use event payload (msg.level) directly (NO ping) and decide using cached players.
+--  - On PLAYER join/leave wake: ping hub for full authoritative state (players list + level), update caches, decide.
+--  - On hub_announce/hub_here: re-register + resync (ping).
 --
 -- Requires hub using PROTO = "sam_hub_v1" for ALL send/broadcast/receive.
 
@@ -41,6 +41,19 @@ local function setOutput(on)
   log(("Set redstone %s = %s"):format(OUTPUT_SIDE, on and "ON" or "OFF"))
 end
 
+local function decideAndAct(level, players)
+  local okPlayer = listHas(players, TARGET_USER)
+  local okLevel  = (level == 15)
+
+  log(("Decision: level=%s (need 15), %s online=%s"):format(
+    tostring(level),
+    TARGET_USER,
+    tostring(okPlayer)
+  ))
+
+  setOutput(okPlayer and okLevel)
+end
+
 -- ===== REDNET SETUP =====
 local function ensureRednet()
   if rednet.isOpen() then return end
@@ -60,7 +73,7 @@ local function discoverHub()
     local deadline = os.clock() + DISCOVER_EVERY_SECONDS
     while os.clock() < deadline do
       local remaining = math.max(0, deadline - os.clock())
-      local sender, msg, protocol = rednet.receive(PROTO, remaining)
+      local sender, msg = rednet.receive(PROTO, remaining)
       if sender and type(msg) == "table" then
         if (msg.type == "hub_here" or msg.type == "hub_announce") then
           local nameOk = (HUB_NAME == nil) or (msg.name == HUB_NAME)
@@ -134,17 +147,18 @@ local function queryState(hubId)
   return nil, nil
 end
 
-local function decideAndAct(level, players)
-  local okPlayer = listHas(players, TARGET_USER)
-  local okLevel  = (level == 15)
+-- ===== LOCAL CACHES =====
+local cachedLevel   = nil
+local cachedPlayers = nil
 
-  log(("Decision: level=%s (need 15), %s online=%s"):format(
-    tostring(level),
-    TARGET_USER,
-    tostring(okPlayer)
+local function cacheAndDecide(level, players, reason)
+  cachedLevel, cachedPlayers = level, players
+  log(("Cache updated (%s): level=%s, players=%s"):format(
+    tostring(reason),
+    tostring(cachedLevel),
+    (type(cachedPlayers) == "table") and tostring(#cachedPlayers) or "nil"
   ))
-
-  setOutput(okPlayer and okLevel)
+  decideAndAct(cachedLevel, cachedPlayers)
 end
 
 -- ===== MAIN =====
@@ -153,12 +167,12 @@ ensureRednet()
 local hubId, hubName = discoverHub()
 registerSubs(hubId)
 
--- Initial sync so output is correct immediately
+-- Initial sync so output is correct immediately + caches are primed
 do
   local level, players = queryState(hubId)
   if level ~= nil and players ~= nil then
     log(("Initial state: level=%d, players=%d"):format(level, #players))
-    decideAndAct(level, players)
+    cacheAndDecide(level, players, "initial_sync")
   else
     log("Initial sync failed; output unchanged until next hub event.")
   end
@@ -168,10 +182,9 @@ log("Sleeping for PROTO-filtered hub events...")
 
 while true do
   log("Sleeping on rednet.receive(PROTO)...")
-  local sender, msg = rednet.receive(PROTO) -- blocks; ignores other protocol traffic
+  local sender, msg = rednet.receive(PROTO)
 
   if sender ~= hubId then
-    -- With PROTO filtering, this is usually another "sam_hub_v1" speaker.
     log(("Wake: message from non-hub id=%d ignored."):format(sender))
 
   elseif type(msg) ~= "table" then
@@ -179,24 +192,47 @@ while true do
 
   else
     if msg.type == "event" then
-      -- Wake trigger
       if msg.event == "redstone" then
+        -- NO PING: redstone payload includes msg.level, so update cachedLevel directly
         log(("Wake EVENT: redstone prev=%s -> level=%s (side=%s)"):format(
           tostring(msg.prev), tostring(msg.level), tostring(msg.side)
         ))
-      elseif msg.event == "playerJoin" or msg.event == "playerLeave" then
-        log(("Wake EVENT: %s username=%s"):format(tostring(msg.event), tostring(msg.username)))
-      else
-        log(("Wake EVENT: %s"):format(tostring(msg.event)))
-      end
 
-      -- Pull authoritative state and act
-      local level, players = queryState(hubId)
-      if level ~= nil and players ~= nil then
-        log(("State after wake: level=%d, players=%d"):format(level, #players))
-        decideAndAct(level, players)
+        cachedLevel = msg.level
+        log(("Cached level updated from redstone event: %s"):format(tostring(cachedLevel)))
+
+        if cachedPlayers ~= nil then
+          decideAndAct(cachedLevel, cachedPlayers)
+        else
+          -- Should only happen if initial sync failed; recover once
+          log("No cached players yet; querying state once to recover...")
+          local level, players = queryState(hubId)
+          if level ~= nil and players ~= nil then
+            cacheAndDecide(level, players, "recover_after_redstone")
+          else
+            log("Could not recover state; not changing output.")
+          end
+        end
+
+      elseif msg.event == "playerJoin" or msg.event == "playerLeave" then
+        -- PING: player event doesn't include full list, so refresh authoritative state
+        log(("Wake EVENT: %s username=%s"):format(tostring(msg.event), tostring(msg.username)))
+        local level, players = queryState(hubId)
+        if level ~= nil and players ~= nil then
+          cacheAndDecide(level, players, "player_event")
+        else
+          log("Could not get state after player event; not changing output.")
+        end
+
       else
-        log("Could not get state after wake; not changing output.")
+        -- Unknown event: safest to resync
+        log(("Wake EVENT: %s (unknown) -> resyncing"):format(tostring(msg.event)))
+        local level, players = queryState(hubId)
+        if level ~= nil and players ~= nil then
+          cacheAndDecide(level, players, "unknown_event")
+        else
+          log("Could not get state after unknown event; not changing output.")
+        end
       end
 
     elseif msg.type == "hub_announce" or msg.type == "hub_here" then
@@ -205,11 +241,12 @@ while true do
       registerSubs(hubId)
       local level, players = queryState(hubId)
       if level ~= nil and players ~= nil then
-        decideAndAct(level, players)
+        cacheAndDecide(level, players, "hub_reannounce")
+      else
+        log("Resync after hub announce failed; not changing output.")
       end
 
     elseif msg.type == "ok" or msg.type == "error" then
-      -- occasional acks/errors might arrive
       log(("Hub reply: %s %s"):format(tostring(msg.type), tostring(msg.msg)))
 
     else
