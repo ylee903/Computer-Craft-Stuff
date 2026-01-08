@@ -1,5 +1,5 @@
 NAME "IF Plant Automation – Bottom Sides Only"
-Every 21 Ticks DO
+Every redstone pulse DO
     INPUT forge_energy:: FROM Energy_Cell BOTTOM SIDE
     OUTPUT forge_energy:: TO Plant_Gatherer
     OUTPUT forge_energy:: TO Plant_Fertilizer
@@ -7,7 +7,7 @@ Every 21 Ticks DO
 END
 
 -- Every 40 ticks: items/fluids bottom-only and any other Stuff
-EVERY 81 TICKS DO
+EVERY 37 TICKS DO
     -- Distribute power every whatever ticks
 
 
@@ -20,10 +20,6 @@ FORGET
     -- Any saplings -> Plant Sower
     INPUT *sapling FROM Interface BOTTOM SIDE
     OUTPUT TO Plant_Sower BOTTOM SIDE
-FORGET
-    -- Any fluid from Plant Sower -> Interface
-    INPUT fluid:: FROM Plant_Sower BOTTOM SIDE
-    OUTPUT fluid:: TO Interface BOTTOM SIDE
 FORGET
     -- Bonemeal -> Plant Fertilizer
     INPUT minecraft:bone_meal FROM Interface BOTTOM SIDE
