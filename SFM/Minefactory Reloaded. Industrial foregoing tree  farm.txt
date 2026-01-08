@@ -1,24 +1,27 @@
 NAME "IF Plant Automation – Bottom Sides Only"
 
--- Distribute power every 20 ticks (unchanged)
-EVERY 20 TICKS DO
+
+-- Every 40 ticks: items/fluids bottom-only and any other Stuff
+EVERY 41 TICKS DO
+    -- Distribute power every whatever ticks
     INPUT forge_energy:: FROM Energy_Cell BOTTOM SIDE
     OUTPUT forge_energy:: TO Plant_Gatherer
     OUTPUT forge_energy:: TO Plant_Sower
     OUTPUT forge_energy:: TO Plant_Fertilizer
-END
-
--- Every 40 ticks do all moves (items/fluids bottom-only)
-EVERY 40 TICKS DO
-    -- Any saplings (wildcard) from Interface bottom -> Plant Sower bottom
+Forget
+    -- Plant Gatherer drops -> Interface
+    INPUT FROM Plant_Gatherer BOTTOM SIDE
+    OUTPUT TO Interface BOTTOM SIDE
+FORGET
+    -- Any saplings -> Plant Sower
     INPUT *sapling FROM Interface BOTTOM SIDE
     OUTPUT TO Plant_Sower BOTTOM SIDE
 FORGET
-    -- Any fluid from Plant Sower bottom -> Interface bottom
+    -- Any fluid from Plant Sower -> Interface
     INPUT fluid:: FROM Plant_Sower BOTTOM SIDE
     OUTPUT fluid:: TO Interface BOTTOM SIDE
 FORGET
-    -- Bonemeal from Interface bottom -> Plant Fertilizer bottom
+    -- Bonemeal -> Plant Fertilizer
     INPUT minecraft:bone_meal FROM Interface BOTTOM SIDE
     OUTPUT minecraft:bone_meal TO Plant_Fertilizer BOTTOM SIDE
 END
