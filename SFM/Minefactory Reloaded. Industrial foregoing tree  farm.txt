@@ -1,13 +1,17 @@
 NAME "IF Plant Automation – Bottom Sides Only"
-
-
--- Every 40 ticks: items/fluids bottom-only and any other Stuff
-EVERY 41 TICKS DO
-    -- Distribute power every whatever ticks
+Every 21 Ticks DO
     INPUT forge_energy:: FROM Energy_Cell BOTTOM SIDE
     OUTPUT forge_energy:: TO Plant_Gatherer
-    OUTPUT forge_energy:: TO Plant_Sower
     OUTPUT forge_energy:: TO Plant_Fertilizer
+    OUTPUT forge_energy:: TO Plant_Sower
+END
+
+-- Every 40 ticks: items/fluids bottom-only and any other Stuff
+EVERY 81 TICKS DO
+    -- Distribute power every whatever ticks
+
+
+
 Forget
     -- Plant Gatherer drops -> Interface
     INPUT FROM Plant_Gatherer BOTTOM SIDE
