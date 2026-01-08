@@ -4,18 +4,19 @@ Every redstone pulse DO
     OUTPUT forge_energy:: TO Plant_Gatherer
     OUTPUT forge_energy:: TO Plant_Fertilizer
     OUTPUT forge_energy:: TO Plant_Sower
-END
-
--- Every 40 ticks: items/fluids bottom-only and any other Stuff
-EVERY 37 TICKS DO
-    -- Distribute power every whatever ticks
-
-
-
 Forget
     -- Plant Gatherer drops -> Interface
     INPUT FROM Plant_Gatherer BOTTOM SIDE
     OUTPUT TO Interface BOTTOM SIDE
+END
+
+-- Every 40 ticks: items/fluids bottom-only and any other Stuff
+EVERY 137 TICKS DO
+    -- Distribute power every whatever ticks
+
+
+
+
 FORGET
     -- Any saplings -> Plant Sower
     INPUT *sapling FROM Interface BOTTOM SIDE
