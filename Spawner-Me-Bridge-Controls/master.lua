@@ -970,145 +970,175 @@ local function setSlaveMode(slaveName, mode)
   doRuleScanNow()
 end
 
--- ====== RECEIVER LOOP (spawner protocol) ======
-local function receiverLoop()
+-- ====== UNIFIED RECEIVER (IMMEDIATE RESPONSE) ======
+local function unifiedReceiverLoop()
+  local nextHubDiscoverAt = 0
+  local awaitingHubQuery = false
+  local queryStartAt = nil
+
   while true do
-    local sender, msg = rednet.receive(PROTOCOL, 0.5)
-    if sender and type(msg) == "table" and msg.kind then
-      -- MASTER_DISCOVER (unsigned) -> reply MASTER_HERE (unsigned)
-      if msg.kind == "MASTER_DISCOVER" then
-        rednet.send(sender, { kind="MASTER_HERE" }, PROTOCOL)
+    local t = now()
 
-      -- REGISTER (signed)
-      elseif msg.kind == "REGISTER" and msg.slave then
-        local payload = "REGISTER|"..tostring(msg.slave).."|"..tostring(msg.value or "")
-        if msg.s == sig(cfg.key, payload) then
-          local name = msg.slave
-          state.slaveIds[name] = sender
-
-          -- ensure exists in cfg.slaves
-          local exists = false
-          for _, n in ipairs(cfg.slaves) do if n == name then exists = true break end end
-          if not exists then
-            table.insert(cfg.slaves, name)
-            cfg.slave_cfg[name] = cfg.slave_cfg[name] or { mode = "AUTO", rules = { on_any = {}, off_all = {} } }
-            cfg.slave_cfg[name].rules = cfg.slave_cfg[name].rules or { on_any = {}, off_all = {} }
-            cfg.slave_cfg[name].rules.on_any = cfg.slave_cfg[name].rules.on_any or {}
-            cfg.slave_cfg[name].rules.off_all = cfg.slave_cfg[name].rules.off_all or {}
-            saveCfg(cfg)
-            log("Registered NEW slave: " .. name .. " (id " .. sender .. ")")
-            fullRedraw()
-          else
-            -- id may change after reboot
-            log("Registered slave: " .. name .. " (id " .. sender .. ")")
-          end
-
-          -- ask for status once on register (no spam)
-          requestStatusOne(name)
-        end
-
-      -- STATUS_RSP (signed, stable valueStr)
-      elseif msg.kind == "STATUS_RSP" and msg.slave then
-        local vpart = msg.valueStr or tostring(msg.value or "")
-        local payload = "STATUS_RSP|"..tostring(msg.slave).."|"..tostring(vpart)
-        if msg.s == sig(cfg.key, payload) then
-          local name = msg.slave
-          local v = msg.value
-          state.status[name] = state.status[name] or {}
-          if type(v) == "table" then
-            state.status[name].actual  = v.actual  or state.status[name].actual
-            state.status[name].enabled = v.enabled
-            state.status[name].side    = v.side    or state.status[name].side
-            state.status[name].reason  = v.reason  or state.status[name].reason
-          else
-            state.status[name].reason = tostring(v)
-          end
-          state.status[name].last = now()
-        end
-      end
-    end
-  end
-end
-
--- ====== HUB LOOP ======
-local function hubLoop()
-  while true do
-    -- If hub not discovered, try discover + register
-    if not state.hub.id then
-      local id, name = hub.discoverHub(HUB_DISCOVER_EVERY_SEC)
-      if id then
-        state.hub.id = id
-        state.hub.name = name
-        log("Hub discovered: " .. tostring(name) .. " (id " .. tostring(id) .. ")")
-
-        -- subscribe to level changes + allowed player join/leave
-        if hub.register then
-          -- if module supports custom subs, it may do it internally;
-          -- fallback hub.register subscribes anyChange + allowed join/leave
-          hub.register(id)
-        else
-          -- safest fallback: send register directly
-          rednet.send(id, {
-            type = "register",
-            subs = {
-              redstone = { anyChange = true },
-              players  = { join = {"Samuel12345678","Amball2000","josherage"}, leave={"Samuel12345678","Amball2000","josherage"} },
-            }
-          }, HUB_PROTO)
-        end
-
-        -- ONE boot query for immediate correctness if possible
-        if hub.queryState then
-          local st = hub.queryState(id, HUB_QUERY_TIMEOUT_SEC)
-          if st and type(st) == "table" then
-            if type(st.level) == "number" then
-              state.hub.level = st.level
-              state.hub.cap = capFromLevel(st.level)
-            end
-            if st.players then
-              setPlayersFromList(st.players)
-            end
-            computeLockoutStrings()
-          end
-        end
-      else
-        -- no hub found; remain locked out (players unknown)
-        computeLockoutStrings()
-      end
+    -- Hub discovery (if not connected)
+    if not state.hub.id and t >= nextHubDiscoverAt then
+      nextHubDiscoverAt = t + HUB_DISCOVER_EVERY_SEC
+      rednet.broadcast({ type = "hub_discover" }, HUB_PROTO)
     end
 
-    -- Process hub events (non-blocking-ish)
-    local sender, msg = rednet.receive(HUB_PROTO, 0.5)
-    if sender == state.hub.id and type(msg) == "table" then
-      if msg.type == "event" then
-        state.hub.lastEventAt = now()
+    -- UNIFIED RECEIVE: receives on ANY protocol with short timeout
+    local sender, msg, protocol = rednet.receive(nil, 0.1)
 
-        if msg.event == "redstone" and type(msg.level) == "number" then
-          state.hub.level = msg.level
-          state.hub.cap = capFromLevel(msg.level)
-          -- no need to ping; cached update is enough
-          computeLockoutStrings()
-          doRuleScanNow() -- re-evaluate limiter ASAP
+    if sender and type(msg) == "table" then
+      
+      -- ========== SPAWNER PROTOCOL (slave messages) ==========
+      if protocol == PROTOCOL then
+        
+        if msg.kind == "MASTER_DISCOVER" then
+          rednet.send(sender, { kind="MASTER_HERE" }, PROTOCOL)
 
-        elseif (msg.event == "playerJoin" or msg.event == "playerLeave") then
-          if msg.players ~= nil then
+        elseif msg.kind == "REGISTER" and msg.slave then
+          local payload = "REGISTER|"..tostring(msg.slave).."|"..tostring(msg.value or "")
+          if msg.s == sig(cfg.key, payload) then
+            local name = msg.slave
+            state.slaveIds[name] = sender
+
+            local exists = false
+            for _, n in ipairs(cfg.slaves) do 
+              if n == name then exists = true; break end 
+            end
+            
+            if not exists then
+              table.insert(cfg.slaves, name)
+              cfg.slave_cfg[name] = cfg.slave_cfg[name] or { 
+                mode = "AUTO", 
+                rules = { on_any = {}, off_all = {} } 
+              }
+              cfg.slave_cfg[name].rules = cfg.slave_cfg[name].rules or { on_any = {}, off_all = {} }
+              cfg.slave_cfg[name].rules.on_any = cfg.slave_cfg[name].rules.on_any or {}
+              cfg.slave_cfg[name].rules.off_all = cfg.slave_cfg[name].rules.off_all or {}
+              saveCfg(cfg)
+              log("Registered NEW slave: " .. name .. " (id " .. sender .. ")")
+              fullRedraw()
+            else
+              log("Registered slave: " .. name .. " (id " .. sender .. ")")
+            end
+
+            requestStatusOne(name)
+          end
+
+        elseif msg.kind == "STATUS_RSP" and msg.slave then
+          local vpart = msg.valueStr or tostring(msg.value or "")
+          local payload = "STATUS_RSP|"..tostring(msg.slave).."|"..tostring(vpart)
+          if msg.s == sig(cfg.key, payload) then
+            local name = msg.slave
+            local v = msg.value
+            state.status[name] = state.status[name] or {}
+            
+            if type(v) == "table" then
+              state.status[name].actual  = v.actual  or state.status[name].actual
+              state.status[name].enabled = v.enabled
+              state.status[name].side    = v.side    or state.status[name].side
+              state.status[name].reason  = v.reason  or state.status[name].reason
+            else
+              state.status[name].reason = tostring(v)
+            end
+            state.status[name].last = t
+          end
+        end
+
+      -- ========== HUB PROTOCOL ==========
+      elseif protocol == HUB_PROTO then
+        
+        if msg.type == "hub_here" or msg.type == "hub_announce" then
+          local name = msg.name
+          if (not HUB_NAME) or (name == HUB_NAME) then
+            if not state.hub.id or sender ~= state.hub.id then
+              state.hub.id = sender
+              state.hub.name = name
+              log("Hub discovered: " .. tostring(name) .. " (id " .. tostring(sender) .. ")")
+
+              -- Register subscriptions
+              rednet.send(sender, {
+                type = "register",
+                subs = {
+                  redstone = { anyChange = true },
+                  players  = { 
+                    join = {"Samuel12345678","Amball2000","josherage"}, 
+                    leave = {"Samuel12345678","Amball2000","josherage"} 
+                  },
+                }
+              }, HUB_PROTO)
+
+              -- Request initial state
+              rednet.send(sender, { type = "query", q = "state" }, HUB_PROTO)
+              awaitingHubQuery = true
+              queryStartAt = t
+            end
+          end
+
+        elseif msg.type == "state" and sender == state.hub.id then
+          awaitingHubQuery = false
+          
+          if type(msg.level) == "number" then
+            state.hub.level = msg.level
+            state.hub.cap = capFromLevel(msg.level)
+          end
+          
+          if msg.players then
             setPlayersFromList(msg.players)
-          else
-            -- if hub doesn't include snapshot, keep previous (or unknown)
-            -- safest: mark unknown so we lock out until a proper snapshot or manual query
-            state.hub.playersKnown = false
           end
+          
           computeLockoutStrings()
+          log("Hub state: level=" .. tostring(state.hub.level) .. 
+              " cap=" .. tostring(state.hub.cap) .. 
+              " allowed=" .. tostring(state.hub.allowedOnline))
+          
           doRuleScanNow()
-        end
 
-      elseif msg.type == "hub_announce" or msg.type == "hub_here" then
-        -- hub rebooted: update id/name if needed; re-register
-        state.hub.id = sender
-        state.hub.name = msg.name or state.hub.name
-        if hub.register then hub.register(sender) end
+        elseif msg.type == "event" and sender == state.hub.id then
+          state.hub.lastEventAt = t
+
+          if msg.event == "redstone" and type(msg.level) == "number" then
+            local oldLevel = state.hub.level
+            local oldCap = state.hub.cap
+            
+            state.hub.level = msg.level
+            state.hub.cap = capFromLevel(msg.level)
+            
+            log("Redstone: " .. tostring(oldLevel) .. "→" .. tostring(msg.level) .. 
+                " (cap " .. tostring(oldCap) .. "→" .. tostring(state.hub.cap) .. ")")
+            
+            computeLockoutStrings()
+            doRuleScanNow()
+
+          elseif msg.event == "playerJoin" or msg.event == "playerLeave" then
+            if msg.players ~= nil then
+              local wasAllowed = state.hub.allowedOnline
+              setPlayersFromList(msg.players)
+              log("Player " .. msg.event .. ": " .. 
+                  (state.hub.allowedOnline and "ALLOWED" or "NOT ALLOWED"))
+              
+              if wasAllowed and not state.hub.allowedOnline then
+                log("Lost allowed player - forcing all OFF")
+              end
+            else
+              state.hub.playersKnown = false
+            end
+            
+            computeLockoutStrings()
+            doRuleScanNow()
+          end
+        end
       end
     end
+
+    -- Timeout hub query if needed
+    if awaitingHubQuery and queryStartAt and (t - queryStartAt) > HUB_QUERY_TIMEOUT_SEC then
+      awaitingHubQuery = false
+      log("Hub query timeout - continuing without initial state")
+    end
+
+    sleep(0.05)
   end
 end
 
@@ -1292,8 +1322,7 @@ requestStatusAll()
 
 parallel.waitForAny(
   uiLoop,
-  receiverLoop,
+  unifiedReceiverLoop,
   ruleLoop,
-  mePollLoop,
-  hubLoop
+  mePollLoop
 )
