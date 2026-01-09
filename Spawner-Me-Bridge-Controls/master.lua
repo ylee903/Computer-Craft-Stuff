@@ -1,27 +1,23 @@
 -- startup.lua (MASTER)
--- Spawner Master (smooth UI):
---   * ZERO full-screen clears during normal operation (only on page change / manual redraw)
---   * ME energy + lockout banner update smoothly (cached poller -> UI just paints cached strings)
---   * Rule engine runs on RULE_TICK_SEC + on-demand scan button
---   * Heartbeat ACK broadcast every HEARTBEAT_SEC
---   * RESET/RESUME button broadcasts RESUME (requires slave support) and re-allows CMD resend
+-- Spawner Master (smooth UI) + Efficient networking:
+--   * NO heartbeat loop (slaves default OFF at boot)
+--   * NO periodic status polling (status only on startup/query/cmd/open detail)
+--   * Private protocol derived from shared key (reduces public rednet noise)
+--   * Slaves REGISTER so master learns slave computer IDs
+--   * All commands/status requests use rednet.send() (no broadcast wake-spam)
 --
--- Why this version feels like your old UI skeleton:
+-- UI behaviour preserved:
 --   - No blocking ME Bridge calls inside the UI event loop.
---   - No clearLine() spam in the header.
---   - Header is repainted only if the composed line actually changed.
---   - Full page redraw only when something structural changes (page/nav/selection).
+--   - Header is repainted only if the composed line changed.
+--   - Full page redraw only on page/nav/selection.
 
-local CONFIG   = "master.cfg"
-local PROTOCOL = "spawner_ctrl_v3"
+local CONFIG = "master.cfg"
 
 -- ====== TUNABLES ======
 local RULE_TICK_SEC   = 1.0     -- rule eval + item cache scan interval
-local ME_POLL_SEC     = 0.5     -- ME energy poll (cached). 0.5 = very responsive
+local ME_POLL_SEC     = 0.5     -- ME energy poll (cached). Keep 0.5 while developing
 local UI_REFRESH_SEC  = 0.25    -- UI header refresh tick (paints cached strings)
 local ME_MIN_PCT      = 0.50    -- lockout if stored/capacity < 50%
-local HEARTBEAT_SEC   = 4.9     -- ACK broadcast
-local STATUS_POLL_SEC = 5.0     -- periodic status request (optional)
 
 -- ====== UTIL ======
 local function openModem()
@@ -54,6 +50,7 @@ local function safeCall(fn, ...)
   return a, b, c, d
 end
 
+-- Lightweight signature (casual spoofing deterrent)
 local function sig(key, payload)
   local s = tostring(payload) .. "|" .. tostring(key)
   local h = 0
@@ -61,6 +58,11 @@ local function sig(key, payload)
     h = (h * 33 + string.byte(s, i)) % 2147483647
   end
   return tostring(h)
+end
+
+-- Private protocol derived from shared key
+local function protoFromKey(key)
+  return "sp_" .. sig(key, "proto"):sub(1, 8)
 end
 
 local function padRight(s, n)
@@ -84,7 +86,7 @@ local cfg = loadCfg()
 if not cfg then
   term.clear(); term.setCursorPos(1,1)
   print("No " .. CONFIG .. " found.")
-  print("Create it with your editor programs first (slaves.lua / rules.lua).")
+  print("Create it with your editor programs first (Master_config_editor.lua / rules_configurator.lua).")
   return
 end
 
@@ -112,6 +114,13 @@ if not cfg.key or cfg.key == "" then
   saveCfg(cfg)
   print("Key saved to " .. CONFIG)
   sleep(0.8)
+end
+
+-- Derive/store protocol from key (reduces public rednet collisions)
+local PROTOCOL = cfg.protocol or protoFromKey(cfg.key)
+if cfg.protocol ~= PROTOCOL then
+  cfg.protocol = PROTOCOL
+  saveCfg(cfg)
 end
 
 if not openModem() then error("No modem found.") end
@@ -151,6 +160,12 @@ local state = {
   -- from slaves
   status = {},
 
+  -- network: discovered online slave IDs
+  net = {
+    slaveId = {},   -- [slaveName] = computerId
+    lastSeen = {},  -- [slaveName] = time
+  },
+
   -- rule engine
   rule = {
     nextScanAt   = 0,
@@ -188,12 +203,16 @@ local state = {
   _lastHeaderLine2 = nil,
 }
 
--- ====== REDNET SEND ======
+-- ====== REDNET SEND (TARGETED) ======
 local function sendToSlave(slaveName, kind, value)
+  local id = state.net.slaveId[slaveName]
+  if not id then return false end
+
   local v = (type(value) == "string") and value or tostring(value or "")
   local payload = (kind or "") .. "|" .. (slaveName or "") .. "|" .. v
   local msg = { kind = kind, slave = slaveName, value = value, valueStr = v, s = sig(cfg.key, payload) }
-  rednet.broadcast(msg, PROTOCOL)
+  rednet.send(id, msg, PROTOCOL)
+  return true
 end
 
 local function requestStatusAll()
@@ -208,16 +227,9 @@ local function requestStatusOne(name)
   end
 end
 
-local function sendAckAll()
-  for _, name in ipairs(cfg.slaves) do
-    sendToSlave(name, "ACK", "1")
-  end
-end
-
 local function sendResumeAll()
   for _, name in ipairs(cfg.slaves) do
     sendToSlave(name, "RESUME", "1")
-    sendToSlave(name, "ACK", "1")
   end
 end
 
@@ -353,10 +365,13 @@ local function applyDesired(slave, desired, why)
   state.status[slave].desired = desired
   state.status[slave].reason  = why or state.status[slave].reason
 
-  -- IMPORTANT: when you press RESUME we clear lastSent so commands resend.
   if state.rule.lastSent[slave] ~= desired then
-    sendToSlave(slave, "CMD", desired)
-    state.rule.lastSent[slave] = desired
+    local ok = sendToSlave(slave, "CMD", desired)
+    if ok then
+      state.rule.lastSent[slave] = desired
+      -- ask only that slave for status to refresh UI quickly
+      requestStatusOne(slave)
+    end
   end
 end
 
@@ -378,7 +393,6 @@ local function writeAt(x, y, text, fg, bg)
   mon.write(text)
 end
 
--- Smooth header painter: writes full padded line; no clearLine().
 local function paintLine(y, bg, fg, s)
   local w,_ = mon.getSize()
   s = padRight(s, w)
@@ -427,7 +441,7 @@ local function computeLayoutDashboard()
     { key="actual",  title="State",  min=5  },
     { key="desired", title="Want",   min=5  },
     { key="reason",  title="Reason", min=10 },
-    { key="hb",      title="HB",     min=6  },
+    { key="seen",    title="Seen",   min=8  },
   }
 
   local sep = 1
@@ -509,10 +523,8 @@ local function composeHeaderLine1()
   local left = "Spawner Master"
   local right = state.me.headerRight or "ME=??"
 
-  -- place right aligned
   local gap = w - (#left + #right)
   if gap < 1 then
-    -- truncate right if too long
     right = right:sub(1, math.max(0, w - #left - 1))
     gap = 1
   end
@@ -534,7 +546,6 @@ local function headerTickPaint()
     state._lastHeaderLine2 = l2
   end
 
-  -- restore defaults
   mon.setBackgroundColor(colors.black)
   mon.setTextColor(colors.white)
 end
@@ -571,6 +582,12 @@ local function fullClearOnce()
   state._lastHeaderLine2 = nil
 end
 
+local function seenAgeStr(slave)
+  local t = state.net.lastSeen[slave]
+  if not t then return "--" end
+  return string.format("%.1fs", now() - t)
+end
+
 local function drawDashboardFull()
   computeLayoutDashboard()
   fullClearOnce()
@@ -600,7 +617,7 @@ local function drawDashboardFull()
       actual = st.actual or "--",
       desired = st.desired or state.rule.lastDesired[name] or "--",
       reason = st.reason or (isLockedOut() and "LOCKOUT" or "--"),
-      hb = st.hbAge or "--",
+      seen = seenAgeStr(name),
     }
 
     local selected = (state.selectedIndex == i)
@@ -632,6 +649,9 @@ local function drawSlaveFull()
     return
   end
 
+  -- request status when opening detail page (as requested)
+  requestStatusOne(name)
+
   local sc = cfg.slave_cfg[name] or { mode="AUTO", rules={on_any={}, off_all={}} }
   local st = state.status[name] or {}
 
@@ -644,7 +664,7 @@ local function drawSlaveFull()
   writeAt(2,6, ("Mode: %s"):format(sc.mode or "AUTO"), colors.white, colors.black)
   writeAt(2,7, ("State: %s   Want: %s"):format(st.actual or "--", st.desired or state.rule.lastDesired[name] or "--"), colors.white, colors.black)
   writeAt(2,8, ("Reason: %s"):format(st.reason or "--"), colors.white, colors.black)
-  writeAt(2,9, ("Rule scan age: %s"):format(age), colors.gray, colors.black)
+  writeAt(2,9, ("Seen age: %s   Rule scan age: %s"):format(seenAgeStr(name), age), colors.gray, colors.black)
 
   writeAt(2,11, "ON triggers (OR):  (ANY item < low)", colors.cyan, colors.black)
   local y = 12
@@ -775,11 +795,27 @@ end
 local function receiverLoop()
   while true do
     local sender, msg = rednet.receive(PROTOCOL, 0.5)
-    if sender and type(msg) == "table" and msg.slave and msg.kind then
-      local vpart = msg.valueStr or tostring(msg.value or "")
-      local payload = (msg.kind or "") .. "|" .. (msg.slave or "") .. "|" .. vpart
-      if msg.s == sig(cfg.key, payload) then
-        if msg.kind == "STATUS_RSP" then
+
+    if sender and type(msg) == "table" then
+      -- Slave discovery (unsigned; harmless)
+      if msg.kind == "MASTER_DISCOVER" then
+        rednet.send(sender, { kind="MASTER_HERE" }, PROTOCOL)
+
+      -- Slave register (signed)
+      elseif msg.kind == "REGISTER" and msg.slave then
+        local payload = "REGISTER|"..tostring(msg.slave).."|"..tostring(msg.value or "")
+        if msg.s == sig(cfg.key, payload) then
+          state.net.slaveId[msg.slave] = sender
+          state.net.lastSeen[msg.slave] = now()
+          -- immediately ask for status so UI updates
+          requestStatusOne(msg.slave)
+        end
+
+      -- Status response (signed)
+      elseif msg.kind == "STATUS_RSP" and msg.slave then
+        local vpart = msg.valueStr or tostring(msg.value or "")
+        local payload = (msg.kind or "") .. "|" .. (msg.slave or "") .. "|" .. vpart
+        if msg.s == sig(cfg.key, payload) then
           local name = msg.slave
           local v = msg.value
           state.status[name] = state.status[name] or {}
@@ -792,39 +828,16 @@ local function receiverLoop()
             state.status[name].reason = tostring(v)
           end
           state.status[name].last = now()
+          state.net.lastSeen[name] = now()
         end
       end
     end
-
-    for _, name in ipairs(cfg.slaves) do
-      local st = state.status[name]
-      if st and st.last then
-        st.hbAge = string.format("%.1fs", now() - st.last)
-      end
-    end
-  end
-end
-
--- ====== HEARTBEAT LOOP ======
-local function heartbeatLoop()
-  while true do
-    sendAckAll()
-    sleep(HEARTBEAT_SEC)
-  end
-end
-
--- ====== STATUS POLL LOOP ======
-local function statusPollLoop()
-  while true do
-    requestStatusAll()
-    sleep(STATUS_POLL_SEC)
   end
 end
 
 -- ====== ME POLL LOOP (CACHED) ======
 local function mePollLoop()
   while true do
-    -- re-attach bridge if it was missing / got reconnected
     if not bridge then bridge = tryAttachBridge() end
 
     if bridge then
@@ -885,14 +898,12 @@ end
 
 -- ====== UI LOOP (EVENT DRIVEN) ======
 local function uiLoop()
-  -- prime lastDesired/sent
   for _, name in ipairs(cfg.slaves) do
     state.rule.lastDesired[name] = state.rule.lastDesired[name] or "OFF"
     state.rule.lastSent[name] = nil
   end
 
   fullRedraw()
-
   local tUI = os.startTimer(UI_REFRESH_SEC)
 
   while true do
@@ -900,13 +911,11 @@ local function uiLoop()
 
     if ev == "timer" and p1 == tUI then
       tUI = os.startTimer(UI_REFRESH_SEC)
-      -- header only (diff-based)
       headerTickPaint()
 
     elseif ev == "monitor_touch" then
       local x, y = p2, p3
 
-      -- Ensure layout for current page exists before hit test
       if state.pageName == "DASH" then
         computeLayoutDashboard()
       elseif state.pageName == "SLAVE" then
@@ -917,13 +926,12 @@ local function uiLoop()
 
       local changed = false
 
-      -- buttons
       for _, b in ipairs(state.ui.buttons) do
         if inRect(x, y, b.x, b.y, b.w, b.h) then
           if state.pageName == "DASH" then
             if b.id == "ARM" then doArmToggle(); changed = true
             elseif b.id == "STOP" then doStopToggle(); changed = true
-            elseif b.id == "SCAN" then doRuleScanNow(); changed = false -- no need full redraw
+            elseif b.id == "SCAN" then doRuleScanNow(); changed = false
             elseif b.id == "RESUME" then doResumeNow(); changed = false
             elseif b.id == "QUERY" then requestStatusAll(); changed = false
             elseif b.id == "RULES" then gotoPage("RULES"); changed = true
@@ -940,7 +948,7 @@ local function uiLoop()
             elseif b.id == "FON" then setSlaveMode(name, "FORCEON"); changed = true
             elseif b.id == "FOFF" then setSlaveMode(name, "FORCEOFF"); changed = true
             end
-          else -- RULES
+          else
             if b.id == "BACK" then gotoPage("DASH"); changed = true
             elseif b.id == "PREV" then state.rulesPage = math.max(1, state.rulesPage - 1); changed = true
             elseif b.id == "NEXT" then state.rulesPage = state.rulesPage + 1; changed = true
@@ -950,7 +958,6 @@ local function uiLoop()
         end
       end
 
-      -- row tap (dashboard)
       if not changed and state.pageName == "DASH" then
         local rowY0 = state.ui.tableTopY
         local idxOnPage = y - rowY0 + 1
@@ -972,7 +979,6 @@ local function uiLoop()
       if changed then
         fullRedraw()
       else
-        -- minimal visual refresh only
         headerTickPaint()
       end
     end
@@ -981,13 +987,13 @@ end
 
 -- ====== STARTUP ======
 computeLockoutStrings()
+
+-- initial status request (only to already-registered slaves; others will register later)
 requestStatusAll()
 
 parallel.waitForAny(
   uiLoop,
   receiverLoop,
   ruleLoop,
-  heartbeatLoop,
-  statusPollLoop,
   mePollLoop
 )
