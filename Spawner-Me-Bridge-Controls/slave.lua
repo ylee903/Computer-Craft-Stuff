@@ -1,6 +1,10 @@
 -- startup.lua (SLAVE) - NO HEARTBEAT, targeted master comms, signed messages
+-- Adds manual local enable switch gate + default output=bottom
 local CONFIG = "slave.cfg"
-local RS_DEFAULT_SIDE = "back"
+
+-- Defaults (still configurable on first run)
+local RS_DEFAULT_OUTPUT_SIDE = "bottom"
+local RS_DEFAULT_MANUAL_SIDE = "left"   -- manual control switch input
 
 -- ===== util =====
 local function openModem()
@@ -54,12 +58,22 @@ if not cfg then
   print("=== Slave setup ===")
   write("Slave name (unique): ") local name = read()
   write("Shared key: ") local key = read("*")
-  write("Redstone output side ["..RS_DEFAULT_SIDE.."]: ")
-  local side = read()
-  if side == "" then side = RS_DEFAULT_SIDE end
-  cfg = { name=name, key=key, side=side }
+
+  write("Redstone OUTPUT side ["..RS_DEFAULT_OUTPUT_SIDE.."]: ")
+  local outSide = read()
+  if outSide == "" then outSide = RS_DEFAULT_OUTPUT_SIDE end
+
+  write("Manual ENABLE input side ["..RS_DEFAULT_MANUAL_SIDE.."]: ")
+  local manSide = read()
+  if manSide == "" then manSide = RS_DEFAULT_MANUAL_SIDE end
+
+  cfg = { name=name, key=key, side=outSide, manualSide=manSide }
   save(cfg)
 end
+
+-- Backwards-compat upgrade if cfg existed from older version
+cfg.side = cfg.side or RS_DEFAULT_OUTPUT_SIDE
+cfg.manualSide = cfg.manualSide or RS_DEFAULT_MANUAL_SIDE
 
 ensureLabel(cfg.name)
 
@@ -71,22 +85,42 @@ if cfg.protocol ~= PROTOCOL then
   save(cfg)
 end
 
--- safe default
-redstone.setOutput(cfg.side, false)
-local enabled = false
+-- ===== state =====
 local masterId = nil
 
-local function setSpawner(on)
-  enabled = on and true or false
-  redstone.setOutput(cfg.side, enabled)
+-- desired comes from master; actual output is gated by manual switch
+local desiredOn = false
+local actualOn  = false
+
+local function manualAllowed()
+  -- Treat non-bool as false safely
+  return redstone.getInput(cfg.manualSide) == true
+end
+
+local function applyOutput()
+  local allow = manualAllowed()
+  actualOn = (desiredOn and allow) and true or false
+  redstone.setOutput(cfg.side, actualOn)
+end
+
+local function setDesired(on)
+  desiredOn = on and true or false
+  applyOutput()
 end
 
 local function statusTable()
+  local allow = manualAllowed()
+  local note = nil
+  if desiredOn and not allow then note = "MANUAL_SWITCH_OFF" end
   return {
     name = cfg.name,
     side = cfg.side,
-    enabled = enabled,
-    actual = enabled and "ON" or "OFF",
+    manualSide = cfg.manualSide,
+    manual = allow,
+    desired = desiredOn and "ON" or "OFF",
+    enabled = actualOn,
+    actual = actualOn and "ON" or "OFF",
+    note = note,
   }
 end
 
@@ -118,44 +152,66 @@ local function registerWithMaster(id)
   rednet.send(id, msg, PROTOCOL)
 end
 
+-- ===== boot safe default =====
+redstone.setOutput(cfg.side, false)
+desiredOn = false
+actualOn = false
+
 -- try to find master at boot (loop until found)
 while not masterId do
-  print(("Slave '%s' booted OFF (side=%s). Looking for master..."):format(cfg.name, cfg.side))
+  print(("Slave '%s' booted OFF (out=%s, manual=%s). Looking for master..."):format(cfg.name, cfg.side, cfg.manualSide))
   masterId = discoverMaster(2.0)
-  if not masterId then
-    sleep(1.0)
-  end
+  if not masterId then sleep(1.0) end
 end
 
 print("Master found:", masterId, " registering...")
 registerWithMaster(masterId)
 
--- ===== main loop =====
-print("Ready. Waiting for commands (no heartbeat).")
-while true do
-  local sender, msg = rednet.receive(PROTOCOL)
-  if sender == masterId and type(msg) == "table" and msg.slave == cfg.name and msg.kind then
-    local payload = (msg.kind or "").."|"..(msg.slave or "").."|"..tostring(msg.value or "")
-    if msg.s == sig(cfg.key, payload) then
-      if msg.kind == "CMD" then
-        if msg.value == "ON" then
-          setSpawner(true)
-          print("CMD ON -> ON")
-        elseif msg.value == "OFF" then
-          setSpawner(false)
-          print("CMD OFF -> OFF")
+print("Ready. Waiting for commands (no heartbeat). Manual gate active.")
+
+-- Optional: detect manual switch changes so output updates instantly even without master traffic
+local function manualWatchLoop()
+  local last = manualAllowed()
+  while true do
+    os.pullEvent("redstone") -- wakes on any redstone change anywhere
+    local nowAllow = manualAllowed()
+    if nowAllow ~= last then
+      last = nowAllow
+      applyOutput()
+      if masterId then sendStatus(masterId) end
+      print(("Manual switch %s -> actual %s (desired %s)"):format(nowAllow and "ON" or "OFF", actualOn and "ON" or "OFF", desiredOn and "ON" or "OFF"))
+    end
+  end
+end
+
+local function commandLoop()
+  while true do
+    local sender, msg = rednet.receive(PROTOCOL)
+    if sender == masterId and type(msg) == "table" and msg.slave == cfg.name and msg.kind then
+      local payload = (msg.kind or "").."|"..(msg.slave or "").."|"..tostring(msg.value or "")
+      if msg.s == sig(cfg.key, payload) then
+        if msg.kind == "CMD" then
+          if msg.value == "ON" then
+            setDesired(true)
+            print("CMD ON -> desired ON, actual " .. (actualOn and "ON" or "OFF"))
+          elseif msg.value == "OFF" then
+            setDesired(false)
+            print("CMD OFF -> desired OFF, actual OFF")
+          end
+          sendStatus(masterId)
+
+        elseif msg.kind == "STATUS_REQ" then
+          sendStatus(masterId)
+
+        elseif msg.kind == "MASTER_HERE" then
+          -- master rebooted; update id + re-register
+          masterId = sender
+          registerWithMaster(masterId)
+          sendStatus(masterId)
         end
-        -- optional: report status after command
-        sendStatus(masterId)
-
-      elseif msg.kind == "STATUS_REQ" then
-        sendStatus(masterId)
-
-      elseif msg.kind == "MASTER_HERE" then
-        -- master rebooted; update id + re-register
-        masterId = sender
-        registerWithMaster(masterId)
       end
     end
   end
 end
+
+parallel.waitForAny(commandLoop, manualWatchLoop)

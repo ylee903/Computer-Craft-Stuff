@@ -1,18 +1,17 @@
 -- startup.lua (MASTER)
 -- Spawner Master + Hub lockout + redstone-based cap limiter
 --
--- Changes vs old version:
---  - NO heartbeat loop
---  - NO periodic status poll loop (status only on startup / query / cmd / opening slave page)
---  - Private protocol derived from shared key (matches slave.lua protoFromKey)
---  - Targeted rednet.send to known slave IDs (no broadcast spam)
---  - Auto slave register/discover handling
---  - Hub integration:
---      * Lockout unless at least one allowed player is online
---      * Uses hub event cache; does ONE boot queryState if possible
---  - Redstone-level cap limiter:
---      * lvl 15->1, 14->2, ... 10->6, <=9 unlimited
---      * FORCEON ignores limiter but consumes slots first (AUTO gets remaining slots)
+-- FIXES:
+--  1) NO require("hub_client") (your hub_client.lua is a standalone program, not a module)
+--  2) No UI freeze: hub + spawner traffic handled via one rednet_message dispatcher loop
+--  3) Lockout mismatch fixed: "Reason" column comes from rule-engine reason, not stale slave status
+--  4) RESTORED: RESET/RESUME button (resends desired states, re-queries hub state/players, requests slave status)
+--
+-- Behavior:
+--  - Locks out unless at least one allowed player is online (from hub state/events)
+--  - Cap limiter from hub redstone level:
+--      lvl 15->1, 14->2, 13->3, 12->4, 11->5, 10->6, <=9 unlimited
+--  - FORCEON bypasses limiter but consumes slots first (AUTO gets remaining slots)
 
 local CONFIG = "master.cfg"
 
@@ -22,13 +21,13 @@ local ME_POLL_SEC     = 0.5
 local UI_REFRESH_SEC  = 0.25
 local ME_MIN_PCT      = 0.50
 
--- Hub config (protocol is fixed by hub)
-local HUB_PROTO       = "sam_hub_v1"
-local HUB_NAME        = "MainHub"  -- set nil to accept any
-local HUB_DISCOVER_EVERY_SEC = 3
+-- Hub
+local HUB_PROTO             = "sam_hub_v1"
+local HUB_NAME              = "MainHub"    -- nil to accept any
+local HUB_DISCOVER_EVERY_SEC = 3.0
 local HUB_QUERY_TIMEOUT_SEC  = 2.5
 
--- Allowed players gate (ANY of these online -> allowed)
+-- Allowed players gate (ANY online -> allowed)
 local ALLOWED_PLAYERS = {
   Samuel12345678 = true,
   Amball2000     = true,
@@ -100,16 +99,7 @@ local function ts()
 end
 
 local function log(msg)
-  -- terminal log (not monitor)
   print(("[%s] %s"):format(ts(), msg))
-end
-
-local function listHas(t, wanted)
-  if type(t) ~= "table" then return false end
-  for _, v in ipairs(t) do
-    if v == wanted then return true end
-  end
-  return false
 end
 
 -- ====== BOOTSTRAP CFG ======
@@ -174,68 +164,6 @@ local function tryAttachBridge()
 end
 local bridge = tryAttachBridge()
 
--- ====== HUB CLIENT (prefer module; fallback internal) ======
-local hub = nil
-do
-  local ok, mod = pcall(require, "hub_client")
-  if ok and type(mod) == "table" then
-    hub = mod
-  end
-end
-
--- Minimal fallback hub impl (only used if hub_client.lua is not a module)
-local function fallbackHub()
-  local H = {}
-  H.PROTO = HUB_PROTO
-
-  function H.discoverHub(timeoutSeconds)
-    rednet.broadcast({ type = "hub_discover" }, HUB_PROTO)
-    local deadline = timeoutSeconds and (os.clock() + timeoutSeconds) or nil
-    while true do
-      local remaining = nil
-      if deadline then
-        remaining = deadline - os.clock()
-        if remaining <= 0 then return nil, nil end
-      end
-      local sender, msg = rednet.receive(HUB_PROTO, remaining)
-      if sender and type(msg) == "table" then
-        if msg.type == "hub_here" or msg.type == "hub_announce" then
-          if (not HUB_NAME) or (msg.name == HUB_NAME) then
-            return sender, msg.name
-          end
-        end
-      end
-    end
-  end
-
-  function H.register(hubId)
-    rednet.send(hubId, {
-      type = "register",
-      subs = {
-        redstone = { anyChange = true },
-        players  = { join = {"Samuel12345678","Amball2000","josherage"}, leave={"Samuel12345678","Amball2000","josherage"} },
-      }
-    }, HUB_PROTO)
-  end
-
-  function H.queryState(hubId, timeoutSeconds)
-    timeoutSeconds = timeoutSeconds or HUB_QUERY_TIMEOUT_SEC
-    rednet.send(hubId, { type = "query", q = "state" }, HUB_PROTO)
-    local deadline = os.clock() + timeoutSeconds
-    while true do
-      local remaining = deadline - os.clock()
-      if remaining <= 0 then return nil end
-      local sender, msg = rednet.receive(HUB_PROTO, remaining)
-      if sender == hubId and type(msg) == "table" and msg.type == "state" then
-        return msg
-      end
-    end
-  end
-
-  return H
-end
-if not hub then hub = fallbackHub() end
-
 -- ====== STATE ======
 local state = {
   pageName = "DASH", -- DASH | SLAVE | RULES
@@ -250,7 +178,7 @@ local state = {
   screenStop = cfg.interlocks.screenStop or false,
 
   -- slave runtime status + ids
-  status = {},        -- [name] = { actual, desired, reason, last, side, enabled }
+  status = {},        -- [name] = { actual, last, side, enabled }
   slaveIds = {},      -- [name] = rednet sender id
 
   -- rule engine
@@ -259,8 +187,9 @@ local state = {
     lastScanAt   = nil,
     scanNow      = true,
     counts       = {},
-    lastDesired  = {},
-    lastSent     = {},
+    lastDesired  = {},  -- [name] = "ON"/"OFF"
+    lastSent     = {},  -- [name] = "ON"/"OFF"
+    reason       = {},  -- [name] = "AUTO"/"FORCEON"/"LOCKOUT"/"CAP"/etc (authoritative for UI)
   },
 
   -- cached ME + lockout strings
@@ -281,11 +210,13 @@ local state = {
     id = nil,
     name = nil,
     level = nil,
-    playersSet = {},   -- [username]=true
-    playersKnown = false, -- becomes true after boot query or event with players snapshot
+    playersSet = {},      -- [username]=true
+    playersKnown = false, -- true after state/players query OR event with msg.players snapshot
     allowedOnline = false,
-    cap = nil,         -- computed from level
+    cap = nil,
     lastEventAt = nil,
+    needQueryPlayers = false,
+    needQueryState = false,
   },
 
   -- UI caching
@@ -297,12 +228,19 @@ local state = {
     footerY = 0,
   },
 
-  -- header draw cache
   _lastHeaderLine1 = nil,
   _lastHeaderLine2 = nil,
 }
 
 -- ====== HUB HELPERS ======
+local function capFromLevel(level)
+  if type(level) ~= "number" then return nil end
+  if level <= 9 then return 999999 end -- unlimited
+  local cap = 16 - level -- 15->1, 14->2, ..., 10->6
+  if cap < 1 then cap = 1 end
+  return cap
+end
+
 local function setPlayersFromList(list)
   state.hub.playersSet = {}
   if type(list) == "table" then
@@ -317,21 +255,12 @@ local function setPlayersFromList(list)
   state.hub.allowedOnline = ok
 end
 
-local function capFromLevel(level)
-  if type(level) ~= "number" then return nil end
-  if level <= 9 then return 999999 end -- unlimited
-  -- 10->6, 11->5, 12->4, 13->3, 14->2, 15->1
-  local cap = 16 - level
-  if cap < 1 then cap = 1 end
-  return cap
-end
-
 local function hubLineRight()
   local lvl = state.hub.level
   local cap = state.hub.cap
   local known = state.hub.playersKnown and "P:OK" or "P:??"
   local allow = state.hub.allowedOnline and "ALLOW" or "NOALLOW"
-  local capStr = ""
+  local capStr
   if cap == nil then
     capStr = "cap=?"
   elseif cap >= 999999 then
@@ -342,7 +271,32 @@ local function hubLineRight()
   return ("Hub=%s %s %s %s"):format(tostring(lvl), capStr, known, allow)
 end
 
--- ====== REDNET SEND (targeted) ======
+local function hubSendRegister()
+  if not state.hub.id then return end
+  rednet.send(state.hub.id, {
+    type = "register",
+    subs = {
+      redstone = { anyChange = true },
+      players  = { join = {"Samuel12345678","Amball2000","josherage"}, leave={"Samuel12345678","Amball2000","josherage"} },
+    }
+  }, HUB_PROTO)
+end
+
+local function hubSendDiscover()
+  rednet.broadcast({ type = "hub_discover" }, HUB_PROTO)
+end
+
+local function hubSendQueryState()
+  if not state.hub.id then return end
+  rednet.send(state.hub.id, { type="query", q="state" }, HUB_PROTO)
+end
+
+local function hubSendQueryPlayers()
+  if not state.hub.id then return end
+  rednet.send(state.hub.id, { type="query", q="players" }, HUB_PROTO)
+end
+
+-- ====== REDNET SEND (spawner, targeted) ======
 local function makeMsg(kind, slaveName, value, valueStr)
   local vstr = valueStr or ((type(value) == "string") and value or tostring(value or ""))
   local payload = (kind or "") .. "|" .. (slaveName or "") .. "|" .. vstr
@@ -355,8 +309,7 @@ local function sendToSlave(slaveName, kind, value)
   if id then
     rednet.send(id, msg, PROTOCOL)
   else
-    -- fallback: broadcast (should be rare; only if not registered yet)
-    rednet.broadcast(msg, PROTOCOL)
+    rednet.broadcast(msg, PROTOCOL) -- rare: before registration
   end
 end
 
@@ -386,8 +339,7 @@ local function computeLockoutStrings()
   if state.screenStop then table.insert(reasons, "SCREEN STOP") end
   if not state.armed then table.insert(reasons, "DISARMED") end
 
-  -- hub players gate:
-  -- If we don't KNOW players yet, be safe: lock out.
+  -- Hub players gate:
   if not state.hub.playersKnown then
     table.insert(reasons, "PLAYERS UNKNOWN")
   elseif not state.hub.allowedOnline then
@@ -507,34 +459,27 @@ local function computeBaseDesired(slave)
   end
 end
 
--- Cap limiter pass:
---  - FORCEON always allowed (even if it exceeds cap)
---  - remaining cap slots go to AUTO "ON" in cfg.slaves order
+-- Cap limiter:
+--  - FORCEON always allowed but consumes slots first
+--  - remaining slots go to AUTO "ON" in cfg.slaves order
 local function applyLimiter(baseDesired, baseWhy, modeMap)
-  local finalDesired = {}
-  local finalWhy = {}
+  local finalDesired, finalWhy = {}, {}
 
-  -- Default: copy base
   for name, d in pairs(baseDesired) do
     finalDesired[name] = d
     finalWhy[name] = baseWhy[name]
   end
 
-  -- If locked out, nothing to do
-  if isLockedOut() then
-    return finalDesired, finalWhy
-  end
+  if isLockedOut() then return finalDesired, finalWhy end
 
   local cap = state.hub.cap
   if cap == nil or cap >= 999999 then
-    return finalDesired, finalWhy -- unlimited / unknown => no limiter (unknown cap doesn't block)
+    return finalDesired, finalWhy
   end
 
-  -- Count FORCEON that are ON first
   local forceOnCount = 0
   for _, name in ipairs(cfg.slaves) do
-    local mode = modeMap[name]
-    if mode == "FORCEON" and finalDesired[name] == "ON" then
+    if modeMap[name] == "FORCEON" and finalDesired[name] == "ON" then
       forceOnCount = forceOnCount + 1
     end
   end
@@ -542,11 +487,9 @@ local function applyLimiter(baseDesired, baseWhy, modeMap)
   local remaining = cap - forceOnCount
   if remaining < 0 then remaining = 0 end
 
-  -- Allow AUTO ON only up to remaining, in list order.
   local allowedAutoOn = 0
   for _, name in ipairs(cfg.slaves) do
-    local mode = modeMap[name]
-    if mode == "AUTO" and finalDesired[name] == "ON" then
+    if modeMap[name] == "AUTO" and finalDesired[name] == "ON" then
       if allowedAutoOn < remaining then
         allowedAutoOn = allowedAutoOn + 1
       else
@@ -561,15 +504,12 @@ end
 
 local function applyDesired(slave, desired, why)
   state.rule.lastDesired[slave] = desired
-  state.status[slave] = state.status[slave] or {}
-  state.status[slave].desired = desired
-  state.status[slave].reason  = why or state.status[slave].reason
+  state.rule.reason[slave] = why or "--"
 
+  -- send if changed
   if state.rule.lastSent[slave] ~= desired then
     sendToSlave(slave, "CMD", desired)
     state.rule.lastSent[slave] = desired
-    -- status is sent by slave after CMD, but we can also request on-demand:
-    -- requestStatusOne(slave)
   end
 end
 
@@ -578,9 +518,7 @@ local function forceAllOff()
     sendToSlave(name, "CMD", "OFF")
     state.rule.lastSent[name] = "OFF"
     state.rule.lastDesired[name] = "OFF"
-    state.status[name] = state.status[name] or {}
-    state.status[name].desired = "OFF"
-    state.status[name].reason = "LOCKOUT"
+    state.rule.reason[name] = "LOCKOUT"
   end
 end
 
@@ -619,6 +557,7 @@ local function computeLayoutDashboard()
     { id="ARM",    label = state.armed and "DISARM" or "ARM" },
     { id="STOP",   label = state.screenStop and "CLEAR STOP" or "STOP" },
     { id="SCAN",   label = "RULE SCAN" },
+    { id="RESUME", label = "RESET/RESUME" },
     { id="QUERY",  label = "QUERY" },
     { id="RULES",  label = "RULES" },
     { id="PREV",   label = "<" },
@@ -648,9 +587,7 @@ local function computeLayoutDashboard()
     return t
   end
 
-  while totalMin() > w and #cols > 4 do
-    table.remove(cols)
-  end
+  while totalMin() > w and #cols > 4 do table.remove(cols) end
 
   for _, c in ipairs(cols) do c.w = c.min end
   local extra = w - totalMin()
@@ -678,6 +615,7 @@ local function computeLayoutSlave()
     { id="BACK",   label="BACK" },
     { id="QUERY",  label="QUERY" },
     { id="SCAN",   label="RULE SCAN" },
+    { id="RESUME", label="RESET/RESUME" },
     { id="AUTO",   label="AUTO" },
     { id="FON",    label="FORCE ON" },
     { id="FOFF",   label="FORCE OFF" },
@@ -718,7 +656,6 @@ local function composeHeaderLine1()
   local w,_ = mon.getSize()
   local left = "Spawner Master"
   local right = (state.me.headerRight or "ME=??") .. "  " .. hubLineRight()
-
   local gap = w - (#left + #right)
   if gap < 1 then
     right = right:sub(1, math.max(0, w - #left - 1))
@@ -754,6 +691,7 @@ local function drawButtons()
     if b.id == "ARM" then bg = state.armed and colors.orange or colors.lime end
     if b.id == "STOP" then bg = colors.red; fg = colors.white end
     if b.id == "SCAN" then bg = colors.cyan; fg = colors.black end
+    if b.id == "RESUME" then bg = colors.purple; fg = colors.white end
     if b.id == "QUERY" then bg = colors.yellow; fg = colors.black end
     if b.id == "RULES" then bg = colors.lightBlue; fg = colors.black end
     if b.id == "PREV" or b.id == "NEXT" then bg = colors.gray; fg = colors.white end
@@ -806,8 +744,8 @@ local function drawDashboardFull()
       name = name,
       mode = mode,
       actual = st.actual or "--",
-      desired = st.desired or state.rule.lastDesired[name] or "--",
-      reason = st.reason or (isLockedOut() and "LOCKOUT" or "--"),
+      desired = state.rule.lastDesired[name] or "--",
+      reason = state.rule.reason[name] or "--",
       age = age,
     }
 
@@ -843,16 +781,14 @@ local function drawSlaveFull()
   local sc = cfg.slave_cfg[name] or { mode="AUTO", rules={on_any={}, off_all={}} }
   local st = state.status[name] or {}
 
-  local age = "--"
-  if state.rule.lastScanAt then
-    age = string.format("%.1fs", now() - state.rule.lastScanAt)
-  end
+  local scanAge = "--"
+  if state.rule.lastScanAt then scanAge = string.format("%.1fs", now() - state.rule.lastScanAt) end
 
   writeAt(2,5, ("Slave: %s"):format(name), colors.white, colors.black)
   writeAt(2,6, ("Mode: %s"):format(sc.mode or "AUTO"), colors.white, colors.black)
-  writeAt(2,7, ("State: %s   Want: %s"):format(st.actual or "--", st.desired or state.rule.lastDesired[name] or "--"), colors.white, colors.black)
-  writeAt(2,8, ("Reason: %s"):format(st.reason or "--"), colors.white, colors.black)
-  writeAt(2,9, ("Rule scan age: %s"):format(age), colors.gray, colors.black)
+  writeAt(2,7, ("State: %s   Want: %s"):format(st.actual or "--", state.rule.lastDesired[name] or "--"), colors.white, colors.black)
+  writeAt(2,8, ("Reason: %s"):format(state.rule.reason[name] or "--"), colors.white, colors.black)
+  writeAt(2,9, ("Rule scan age: %s"):format(scanAge), colors.gray, colors.black)
 
   writeAt(2,11, "ON triggers (OR):  (ANY item < low)", colors.cyan, colors.black)
   local y = 12
@@ -931,7 +867,7 @@ local function fullRedraw()
     drawDashboardFull()
   elseif state.pageName == "SLAVE" then
     drawSlaveFull()
-  elseif state.pageName == "RULES" then
+  else
     drawRulesFull()
   end
 end
@@ -942,6 +878,7 @@ local function doArmToggle()
   cfg.globalAllow = state.armed
   saveCfg(cfg)
   computeLockoutStrings()
+  state.rule.scanNow = true
   if not state.armed then forceAllOff() end
 end
 
@@ -950,12 +887,33 @@ local function doStopToggle()
   cfg.interlocks.screenStop = state.screenStop
   saveCfg(cfg)
   computeLockoutStrings()
+  state.rule.scanNow = true
   if state.screenStop then forceAllOff() end
 end
 
 local function doRuleScanNow()
   state.rule.scanNow = true
   state.rule.nextScanAt = 0
+end
+
+local function doResumeNow()
+  -- Resend desired states even if lastSent matches (clear lastSent)
+  for _, name in ipairs(cfg.slaves) do
+    state.rule.lastSent[name] = nil
+  end
+
+  -- Force fresh hub truth (one-shot) + resubscribe
+  if state.hub.id then
+    hubSendRegister()
+    state.hub.needQueryState = true
+    state.hub.needQueryPlayers = true
+  else
+    hubSendDiscover()
+  end
+
+  -- Request slave status once + rescan rules
+  requestStatusAll()
+  doRuleScanNow()
 end
 
 local function gotoPage(name)
@@ -970,29 +928,44 @@ local function setSlaveMode(slaveName, mode)
   doRuleScanNow()
 end
 
--- ====== UNIFIED RECEIVER (IMMEDIATE RESPONSE) ======
-local function unifiedReceiverLoop()
-  local nextHubDiscoverAt = 0
-  local awaitingHubQuery = false
-  local queryStartAt = nil
+-- ====== COMMS DISPATCH LOOP (ONE place handles all rednet traffic) ======
+local function commsLoop()
+  -- discovery tickers
+  local tHubDiscover = os.startTimer(0.1) -- quick initial discover
+  local tHubQueryDeadline = nil
+  local pendingHubQuery = nil
 
   while true do
-    local t = now()
+    local ev, a, b, c = os.pullEvent()
 
-    -- Hub discovery (if not connected)
-    if not state.hub.id and t >= nextHubDiscoverAt then
-      nextHubDiscoverAt = t + HUB_DISCOVER_EVERY_SEC
-      rednet.broadcast({ type = "hub_discover" }, HUB_PROTO)
-    end
+    if ev == "timer" then
+      local tid = a
 
-    -- UNIFIED RECEIVE: receives on ANY protocol with short timeout
-    local sender, msg, protocol = rednet.receive(nil, 0.1)
+      -- periodic hub discover until found
+      if tid == tHubDiscover then
+        if not state.hub.id then
+          hubSendDiscover()
+          tHubDiscover = os.startTimer(HUB_DISCOVER_EVERY_SEC)
+        else
+          -- if hub exists, just keep timer slow (still useful if hub reboots)
+          tHubDiscover = os.startTimer(HUB_DISCOVER_EVERY_SEC)
+        end
+      end
 
-    if sender and type(msg) == "table" then
-      
-      -- ========== SPAWNER PROTOCOL (slave messages) ==========
-      if protocol == PROTOCOL then
-        
+      -- query timeout handling
+      if pendingHubQuery and tHubQueryDeadline and tid == tHubQueryDeadline then
+        -- timed out
+        pendingHubQuery = nil
+        tHubQueryDeadline = nil
+      end
+
+    elseif ev == "rednet_message" then
+      local sender = a
+      local msg = b
+      local proto = c
+
+      -- ===== Spawner protocol =====
+      if proto == PROTOCOL and type(msg) == "table" and msg.kind then
         if msg.kind == "MASTER_DISCOVER" then
           rednet.send(sender, { kind="MASTER_HERE" }, PROTOCOL)
 
@@ -1003,17 +976,11 @@ local function unifiedReceiverLoop()
             state.slaveIds[name] = sender
 
             local exists = false
-            for _, n in ipairs(cfg.slaves) do 
-              if n == name then exists = true; break end 
-            end
-            
+            for _, n in ipairs(cfg.slaves) do if n == name then exists = true break end end
             if not exists then
               table.insert(cfg.slaves, name)
-              cfg.slave_cfg[name] = cfg.slave_cfg[name] or { 
-                mode = "AUTO", 
-                rules = { on_any = {}, off_all = {} } 
-              }
-              cfg.slave_cfg[name].rules = cfg.slave_cfg[name].rules or { on_any = {}, off_all = {} }
+              cfg.slave_cfg[name] = cfg.slave_cfg[name] or { mode="AUTO", rules={on_any={}, off_all={}} }
+              cfg.slave_cfg[name].rules = cfg.slave_cfg[name].rules or { on_any={}, off_all={} }
               cfg.slave_cfg[name].rules.on_any = cfg.slave_cfg[name].rules.on_any or {}
               cfg.slave_cfg[name].rules.off_all = cfg.slave_cfg[name].rules.off_all or {}
               saveCfg(cfg)
@@ -1024,6 +991,7 @@ local function unifiedReceiverLoop()
             end
 
             requestStatusOne(name)
+            doRuleScanNow()
           end
 
         elseif msg.kind == "STATUS_RSP" and msg.slave then
@@ -1033,112 +1001,95 @@ local function unifiedReceiverLoop()
             local name = msg.slave
             local v = msg.value
             state.status[name] = state.status[name] or {}
-            
             if type(v) == "table" then
               state.status[name].actual  = v.actual  or state.status[name].actual
               state.status[name].enabled = v.enabled
               state.status[name].side    = v.side    or state.status[name].side
-              state.status[name].reason  = v.reason  or state.status[name].reason
-            else
-              state.status[name].reason = tostring(v)
             end
-            state.status[name].last = t
+            state.status[name].last = now()
           end
         end
+      end
 
-      -- ========== HUB PROTOCOL ==========
-      elseif protocol == HUB_PROTO then
-        
+      -- ===== Hub protocol =====
+      if proto == HUB_PROTO and type(msg) == "table" then
+        -- discovery replies
         if msg.type == "hub_here" or msg.type == "hub_announce" then
-          local name = msg.name
-          if (not HUB_NAME) or (name == HUB_NAME) then
-            if not state.hub.id or sender ~= state.hub.id then
+          if (not HUB_NAME) or (msg.name == HUB_NAME) then
+            if state.hub.id ~= sender then
               state.hub.id = sender
-              state.hub.name = name
-              log("Hub discovered: " .. tostring(name) .. " (id " .. tostring(sender) .. ")")
-
-              -- Register subscriptions
-              rednet.send(sender, {
-                type = "register",
-                subs = {
-                  redstone = { anyChange = true },
-                  players  = { 
-                    join = {"Samuel12345678","Amball2000","josherage"}, 
-                    leave = {"Samuel12345678","Amball2000","josherage"} 
-                  },
-                }
-              }, HUB_PROTO)
-
-              -- Request initial state
-              rednet.send(sender, { type = "query", q = "state" }, HUB_PROTO)
-              awaitingHubQuery = true
-              queryStartAt = t
+              state.hub.name = msg.name
+              log("Hub discovered: " .. tostring(msg.name) .. " (id " .. tostring(sender) .. ")")
+              hubSendRegister()
+              state.hub.needQueryState = true
+              state.hub.needQueryPlayers = true
+              doRuleScanNow()
             end
           end
 
-        elseif msg.type == "state" and sender == state.hub.id then
-          awaitingHubQuery = false
-          
-          if type(msg.level) == "number" then
-            state.hub.level = msg.level
-            state.hub.cap = capFromLevel(msg.level)
-          end
-          
-          if msg.players then
-            setPlayersFromList(msg.players)
-          end
-          
-          computeLockoutStrings()
-          log("Hub state: level=" .. tostring(state.hub.level) .. 
-              " cap=" .. tostring(state.hub.cap) .. 
-              " allowed=" .. tostring(state.hub.allowedOnline))
-          
-          doRuleScanNow()
+        elseif state.hub.id and sender == state.hub.id then
+          if msg.type == "event" then
+            state.hub.lastEventAt = now()
 
-        elseif msg.type == "event" and sender == state.hub.id then
-          state.hub.lastEventAt = t
+            if msg.event == "redstone" and type(msg.level) == "number" then
+              state.hub.level = msg.level
+              state.hub.cap = capFromLevel(msg.level)
+              computeLockoutStrings()
+              doRuleScanNow()
 
-          if msg.event == "redstone" and type(msg.level) == "number" then
-            local oldLevel = state.hub.level
-            local oldCap = state.hub.cap
-            
-            state.hub.level = msg.level
-            state.hub.cap = capFromLevel(msg.level)
-            
-            log("Redstone: " .. tostring(oldLevel) .. "→" .. tostring(msg.level) .. 
-                " (cap " .. tostring(oldCap) .. "→" .. tostring(state.hub.cap) .. ")")
-            
+            elseif msg.event == "playerJoin" or msg.event == "playerLeave" then
+              if msg.players ~= nil then
+                setPlayersFromList(msg.players)
+              else
+                -- old hub (no snapshot): safest is mark unknown and do one players query
+                state.hub.playersKnown = false
+                state.hub.needQueryPlayers = true
+              end
+              computeLockoutStrings()
+              doRuleScanNow()
+            end
+
+          elseif msg.type == "state" then
+            if type(msg.level) == "number" then
+              state.hub.level = msg.level
+              state.hub.cap = capFromLevel(msg.level)
+            end
+            if msg.players ~= nil then
+              setPlayersFromList(msg.players)
+            end
             computeLockoutStrings()
             doRuleScanNow()
 
-          elseif msg.event == "playerJoin" or msg.event == "playerLeave" then
+          elseif msg.type == "players" then
             if msg.players ~= nil then
-              local wasAllowed = state.hub.allowedOnline
               setPlayersFromList(msg.players)
-              log("Player " .. msg.event .. ": " .. 
-                  (state.hub.allowedOnline and "ALLOWED" or "NOT ALLOWED"))
-              
-              if wasAllowed and not state.hub.allowedOnline then
-                log("Lost allowed player - forcing all OFF")
-              end
-            else
-              state.hub.playersKnown = false
             end
-            
             computeLockoutStrings()
             doRuleScanNow()
           end
         end
       end
     end
+  end
+end
 
-    -- Timeout hub query if needed
-    if awaitingHubQuery and queryStartAt and (t - queryStartAt) > HUB_QUERY_TIMEOUT_SEC then
-      awaitingHubQuery = false
-      log("Hub query timeout - continuing without initial state")
+-- ====== HUB MAINTENANCE LOOP ======
+local function hubMaintenanceLoop()
+  while true do
+    if state.hub.id then
+      if state.hub.needQueryState then
+        state.hub.needQueryState = false
+        hubSendQueryState()
+        -- if it never arrives, we stay in PLAYERS UNKNOWN (safe)
+        sleep(0.05)
+      end
+      if state.hub.needQueryPlayers then
+        state.hub.needQueryPlayers = false
+        hubSendQueryPlayers()
+        sleep(0.05)
+      end
     end
-
-    sleep(0.05)
+    sleep(0.2)
   end
 end
 
@@ -1189,10 +1140,7 @@ local function ruleLoop()
 
       scanAllTrackedItems()
 
-      -- base desires
-      local baseDesired = {}
-      local baseWhy = {}
-      local modeMap = {}
+      local baseDesired, baseWhy, modeMap = {}, {}, {}
 
       for _, slave in ipairs(cfg.slaves) do
         local d, why, mode = computeBaseDesired(slave)
@@ -1218,10 +1166,10 @@ end
 
 -- ====== UI LOOP (EVENT DRIVEN) ======
 local function uiLoop()
-  -- prime lastDesired/sent
   for _, name in ipairs(cfg.slaves) do
     state.rule.lastDesired[name] = state.rule.lastDesired[name] or "OFF"
     state.rule.lastSent[name] = nil
+    state.rule.reason[name] = state.rule.reason[name] or "--"
   end
 
   fullRedraw()
@@ -1247,14 +1195,22 @@ local function uiLoop()
 
       local changed = false
 
-      -- buttons
       for _, b in ipairs(state.ui.buttons) do
         if inRect(x, y, b.x, b.y, b.w, b.h) then
           if state.pageName == "DASH" then
             if b.id == "ARM" then doArmToggle(); changed = true
             elseif b.id == "STOP" then doStopToggle(); changed = true
             elseif b.id == "SCAN" then doRuleScanNow(); changed = false
-            elseif b.id == "QUERY" then requestStatusAll(); changed = false
+            elseif b.id == "RESUME" then doResumeNow(); changed = false
+            elseif b.id == "QUERY" then
+              requestStatusAll()
+              if state.hub.id then
+                state.hub.needQueryState = true
+                state.hub.needQueryPlayers = true
+              else
+                hubSendDiscover()
+              end
+              changed = false
             elseif b.id == "RULES" then gotoPage("RULES"); changed = true
             elseif b.id == "PREV" then state.page = math.max(1, state.page - 1); changed = true
             elseif b.id == "NEXT" then state.page = state.page + 1; changed = true
@@ -1265,15 +1221,15 @@ local function uiLoop()
             if b.id == "BACK" then gotoPage("DASH"); changed = true
             elseif b.id == "QUERY" then requestStatusOne(name); changed = false
             elseif b.id == "SCAN" then doRuleScanNow(); changed = false
+            elseif b.id == "RESUME" then doResumeNow(); changed = false
             elseif b.id == "AUTO" then setSlaveMode(name, "AUTO"); changed = true
             elseif b.id == "FON" then setSlaveMode(name, "FORCEON"); changed = true
             elseif b.id == "FOFF" then setSlaveMode(name, "FORCEOFF"); changed = true
             end
 
-            -- When opening / interacting with slave page, request status (no spam)
             if name then requestStatusOne(name) end
 
-          else -- RULES
+          else
             if b.id == "BACK" then gotoPage("DASH"); changed = true
             elseif b.id == "PREV" then state.rulesPage = math.max(1, state.rulesPage - 1); changed = true
             elseif b.id == "NEXT" then state.rulesPage = state.rulesPage + 1; changed = true
@@ -1283,7 +1239,6 @@ local function uiLoop()
         end
       end
 
-      -- row tap (dashboard)
       if not changed and state.pageName == "DASH" then
         local rowY0 = state.ui.tableTopY
         local idxOnPage = y - rowY0 + 1
@@ -1298,8 +1253,6 @@ local function uiLoop()
             state.selectedName = cfg.slaves[i]
             gotoPage("SLAVE")
             changed = true
-
-            -- request status on opening slave detail page
             requestStatusOne(state.selectedName)
           end
         end
@@ -1317,12 +1270,22 @@ end
 -- ====== STARTUP ======
 computeLockoutStrings()
 
--- Ask for status once at boot (no periodic spam)
+-- Safe default: until hub confirms players snapshot, we remain locked out
+state.hub.playersKnown = false
+state.hub.allowedOnline = false
+state.hub.cap = nil
+state.hub.level = nil
+
+-- Kick hub discovery immediately
+hubSendDiscover()
+
+-- Ask for status once at boot
 requestStatusAll()
 
 parallel.waitForAny(
   uiLoop,
-  unifiedReceiverLoop,
+  commsLoop,
+  hubMaintenanceLoop,
   ruleLoop,
   mePollLoop
 )
