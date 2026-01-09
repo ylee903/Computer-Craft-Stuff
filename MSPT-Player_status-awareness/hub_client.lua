@@ -1,4 +1,6 @@
 -- hub_client.lua (PROTO version)
+-- Updated to use player list from hub events (no ping required),
+-- but still includes optional queryState() with timeout.
 
 local PROTO = "sam_hub_v1" -- MUST match hub
 local HUB_NAME_PREFERRED = nil -- optionally "MainHub"
@@ -60,14 +62,38 @@ local function register(hubId, redstoneSub, playerSub)
   }, PROTO)
 end
 
-local function queryState(hubId)
+-- Optional "ping" for current authoritative state (with timeout)
+local function queryState(hubId, timeoutSeconds)
+  timeoutSeconds = timeoutSeconds or 3
   rednet.send(hubId, { type = "query", q = "state" }, PROTO)
+
+  local deadline = os.clock() + timeoutSeconds
   while true do
-    local sender, msg = rednet.receive(PROTO)
-    if sender == hubId and type(msg) == "table" and msg.type == "state" then
-      return msg
+    local remaining = deadline - os.clock()
+    if remaining <= 0 then return nil end
+
+    local sender, msg = rednet.receive(PROTO, remaining)
+    if sender == hubId and type(msg) == "table" then
+      if msg.type == "state" then
+        return msg -- { type="state", level=..., players={...} }
+      end
+      -- ignore events/other messages while waiting for state
     end
   end
+end
+
+-- ===== local cached players (set) =====
+local playersSet = {} -- [username]=true
+
+local function setFromList(list)
+  playersSet = {}
+  if type(list) == "table" then
+    for _, u in ipairs(list) do playersSet[u] = true end
+  end
+end
+
+local function hasPlayer(name)
+  return playersSet[name] == true
 end
 
 -- Boot
@@ -80,9 +106,13 @@ if SUBSCRIBE then
   print("Subscribed.")
 end
 
--- Optional initial query:
--- local state = queryState(hubId)
--- print(textutils.serialize(state, {compact=false}))
+-- Optional initial sync (if you want cache immediately, without waiting for next player event)
+-- local st = queryState(hubId, 3)
+-- if st and st.players then
+--   setFromList(st.players)
+--   print(("[players cache] initial sync: %d online; Samuel online=%s")
+--     :format(#st.players, tostring(hasPlayer("Samuel12345678"))))
+-- end
 
 print("Sleeping for targeted events...")
 
@@ -90,6 +120,17 @@ while true do
   local sender, msg = rednet.receive(PROTO)
   if sender == hubId and type(msg) == "table" then
     if msg.type == "event" then
+      -- If hub includes players snapshot on join/leave, update cache
+      if msg.event == "playerJoin" or msg.event == "playerLeave" then
+        if msg.players ~= nil then
+          setFromList(msg.players)
+          print(("[players cache] now %d online; Samuel online=%s")
+            :format(#msg.players, tostring(hasPlayer("Samuel12345678"))))
+        else
+          print("[players cache] hub did not include msg.players (old hub?)")
+        end
+      end
+
       print(textutils.serialize(msg, { compact = false }))
       if DO_PULSE then pulse(PULSE_SIDE, PULSE_SECONDS) end
     end

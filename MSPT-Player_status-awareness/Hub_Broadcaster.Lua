@@ -167,7 +167,14 @@ while true do
 
   elseif ev == "playerJoin" or ev == "playerLeave" then
     local username = p1
-    local payload = { type = "event", event = ev, username = username }
+
+    -- NEW: include full players list after the change (backwards reminder: extra fields are fine)
+    local payload = {
+      type     = "event",
+      event    = ev,
+      username = username,
+      players  = getPlayers()
+    }
 
     sendToMatchingClients(payload, function(s)
       return playerMatches(s.players, ev, username)
