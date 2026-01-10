@@ -1,0 +1,17 @@
+-- beacon.lua
+
+local BEACON_NAME = "N/A_base_grinder__scram"  -- shared group name
+
+-- modem on any side
+local modem = peripheral.find("modem")
+if not modem then
+  error("No modem found")
+end
+
+rednet.open(peripheral.getName(modem))
+os.setComputerLabel(BEACON_NAME)
+
+print("Beacon online:", os.getComputerLabel())
+
+-- true idle, zero CPU
+os.pullEvent("never")

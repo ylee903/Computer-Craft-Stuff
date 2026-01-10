@@ -1,0 +1,51 @@
+-- startup.lua
+
+local OUTPUT_SIDE = "bottom"   -- configurable
+local MANUAL_SIDE = "left"
+
+-- list of acceptable beacon names
+local BEACON_NAMES = {
+  "N/A_base_grinder__scram",
+  -- you can add more names here later
+}
+
+-- ===== find and open any modem =====
+local modem = peripheral.find("modem")
+if not modem then
+  error("No modem found")
+end
+
+local modemSide = peripheral.getName(modem)
+rednet.open(modemSide)
+
+-- ===== boot-time beacon existence check =====
+local beaconFound = false
+
+for _, name in ipairs(BEACON_NAMES) do
+  local id = rednet.lookup(name)
+  if id then
+    print("Beacon found:", name, "(ID "..id..")")
+    beaconFound = true
+    break
+  end
+end
+
+if beaconFound then
+  print("At least one beacon present → enabling output")
+  redstone.setOutput(OUTPUT_SIDE, true)
+else
+  print("No beacons present → output disabled")
+  redstone.setOutput(OUTPUT_SIDE, false)
+end
+
+-- networking no longer needed
+rednet.close(modemSide)
+
+-- ===== normal local control =====
+print("Entering normal local control mode")
+
+while true do
+  local state = redstone.getInput(MANUAL_SIDE)
+  redstone.setOutput(OUTPUT_SIDE, state)
+  sleep(0.1)
+end
