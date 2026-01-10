@@ -572,7 +572,7 @@ local function computeLayoutDashboard()
   end
 
   local cols = {
-    { key="name",    title="Name",   min=16 },
+    { key="name",    title="Name",   min=32 },
     { key="mode",    title="Mode",   min=8  },
     { key="actual",  title="State",  min=5  },
     { key="desired", title="Want",   min=5  },
