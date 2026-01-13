@@ -26,6 +26,7 @@ local HUB_PROTO             = "sam_hub_v1"
 local HUB_NAME              = "MainHub"    -- nil to accept any
 local HUB_DISCOVER_EVERY_SEC = 3.0
 local HUB_QUERY_TIMEOUT_SEC  = 2.5
+local HUB_DEAD_AFTER_SEC     = 5.0
 
 -- Allowed players gate (ANY online -> allowed)
 local ALLOWED_PLAYERS = {
@@ -233,6 +234,26 @@ local state = {
 }
 
 -- ====== HUB HELPERS ======
+local function markHubDead(reason)
+  -- clear hub identity + truth so we fall back to safe lockout
+  state.hub.id = nil
+  state.hub.name = nil
+  state.hub.level = nil
+  state.hub.cap = nil
+
+  state.hub.playersSet = {}
+  state.hub.playersKnown = false
+  state.hub.allowedOnline = false
+
+  state.hub.lastEventAt = nil
+  state.hub.needQueryState = false
+  state.hub.needQueryPlayers = false
+
+  log("Hub DEAD -> lockout (" .. tostring(reason or "timeout") .. ")")
+  computeLockoutStrings()
+  doRuleScanNow()
+end
+
 local function capFromLevel(level)
   if type(level) ~= "number" then return nil end
   if level <= 9 then return 999999 end -- unlimited
@@ -934,6 +955,7 @@ local function commsLoop()
   local tHubDiscover = os.startTimer(0.1) -- quick initial discover
   local tHubQueryDeadline = nil
   local pendingHubQuery = nil
+  local tHubHealth = os.startTimer(0.5) -- check twice a second
 
   while true do
     local ev, a, b, c = os.pullEvent()
@@ -949,6 +971,20 @@ local function commsLoop()
         else
           -- if hub exists, just keep timer slow (still useful if hub reboots)
           tHubDiscover = os.startTimer(HUB_DISCOVER_EVERY_SEC)
+        end
+      end
+
+      -- hub health check
+      if tid == tHubHealth then
+        tHubHealth = os.startTimer(0.5)
+
+        if state.hub.id then
+          local last = state.hub.lastEventAt
+          if (not last) or (now() - last > HUB_DEAD_AFTER_SEC) then
+            markHubDead("no reply > " .. HUB_DEAD_AFTER_SEC .. "s")
+            -- immediately try rediscover
+            hubSendDiscover()
+          end
         end
       end
 
@@ -1013,9 +1049,12 @@ local function commsLoop()
 
       -- ===== Hub protocol =====
       if proto == HUB_PROTO and type(msg) == "table" then
+        -- any hub-proto message counts as "hub alive"
+        -- (if it's actually from the chosen hub id, we’ll also count it below)
         -- discovery replies
         if msg.type == "hub_here" or msg.type == "hub_announce" then
           if (not HUB_NAME) or (msg.name == HUB_NAME) then
+            state.hub.lastEventAt = now()
             if state.hub.id ~= sender then
               state.hub.id = sender
               state.hub.name = msg.name
@@ -1028,9 +1067,8 @@ local function commsLoop()
           end
 
         elseif state.hub.id and sender == state.hub.id then
+          state.hub.lastEventAt = now()
           if msg.type == "event" then
-            state.hub.lastEventAt = now()
-
             if msg.event == "redstone" and type(msg.level) == "number" then
               state.hub.level = msg.level
               state.hub.cap = capFromLevel(msg.level)
